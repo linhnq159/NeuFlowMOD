@@ -162,32 +162,38 @@ def validate_sintel(model,
 
 @torch.no_grad()
 def validate_U3_giam_chan(model,
+                    teacher_model,
                     device,
+                    val_dataset,
+                    dstype,
                     padding_factor=16
                     ):
     """ Peform validation using the Sintel (train) split """
     model.eval()
     results = {}
 
-    val_dataset = datasets.MpiSintel(split='training', dstype=dstype)
-
     print('Number of validation image pairs: %d' % len(val_dataset))
     epe_list = []
 
     for val_id in range(len(val_dataset)):
         
-        image1, image2, flow_gt, _ = val_dataset[val_id]
+        image1, image2, _, _ = val_dataset[val_id]
 
-        image1 = image1.half()
-        image2 = image2.half()
+        # image1 = image1.half()
+        # image2 = image2.half()
+
+        image1 = image1.float()
+        image2 = image2.float()
 
         image1 = image1[None].to(device)
         image2 = image2[None].to(device)
 
-        padder = frame_utils.InputPadder(image1.shape, padding_factor=padding_factor)
-        image1, image2 = padder.pad(image1, image2)
+        # padder = frame_utils.InputPadder(image1.shape, padding_factor=padding_factor)
+        # image1, image2 = padder.pad(image1, image2)
 
         model.init_bhwd(image1.shape[0], image1.shape[-2], image1.shape[-1], device)
+
+        teacher_flow = teacher_model(image1, image2)
 
         with torch.cuda.amp.autocast(enabled=True):
             results_dict = model(image1, image2)
@@ -195,18 +201,16 @@ def validate_U3_giam_chan(model,
         # useful when using parallel branches
         flow_pr = results_dict[-1].float()
 
-        flow = padder.unpad(flow_pr[0]).cpu()
+        # flow = padder.unpad(flow_pr[0]).cpu()
         # flow = flow_pr[0].cpu()
+        flow_gt = teacher_flow[0].cpu()
+        flow = flow_pr[0].cpu()
 
         epe = torch.sum((flow - flow_gt) ** 2, dim=0).sqrt()
         epe_list.append(epe.view(-1).numpy())
 
     epe_all = np.concatenate(epe_list)
     epe = np.mean(epe_all)
-
-    print("Validation Sintel (%s) EPE: %.3f" % (dstype, epe))
-
-    dstype = 'sintel_' + dstype
 
     results[dstype + '_epe'] = np.mean(epe_list)
 

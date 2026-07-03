@@ -6,7 +6,7 @@ import logging
 
 from distillation_loss import DistillationLoss, CharbonnierLoss
 from loss import flow_loss_func
-from data_utils.evaluate import validate_things, validate_sintel, validate_kitti, validate_viper
+from data_utils.evaluate import validate_things, validate_sintel, validate_kitti, validate_viper, validate_U3_giam_chan
 
 from load_model import my_load_weights, my_freeze_model
 import os
@@ -229,7 +229,7 @@ class DistillationTrainer:
                             val_results.update(test_results_dict)
                 
                     if 'U3_giam_chan' in self.args.val_dataset:
-                        test_results_dict = validate_U3_giam_chan(self.model_without_ddp, self.device, self.val_dataset)
+                        test_results_dict = validate_U3_giam_chan(model = self.model_without_ddp, teacher_model = self.teacher,  device = self.device, val_dataset = self.val_dataset, dstype='dot1_T32026')
                         if self.args.local_rank == 0:
                             val_results.update(test_results_dict)
 
