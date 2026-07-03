@@ -165,17 +165,19 @@ class DistillationTrainer:
 
                 with torch.cuda.amp.autocast(enabled=True):
                     flow_preds = self.student(img1, img2, iters_s16=4, iters_s8=7)
-                    # for i in range(flow_preds.shape[0]):
-                    #     flow = flow_preds[i].permute(1,2,0).cpu().detach().numpy()
+                    # for i in range((flow_preds[-1]).shape[0]):
+                    #     flow = flow_preds[-1][i].permute(1,2,0).cpu().detach().numpy()
                     #     print(f"flow_preds_{i} : {flow}")
-                    #     flow = teacher_flow[i].permute(1,2,0).cpu().detach().numpy()
-                    #     print(f"flow_teacher_{i} : {flow}")
+                    #     # flow = teacher_flow[i].permute(1,2,0).cpu().detach().numpy()
+                    #     # print(f"flow_teacher_{i} : {flow}")
                     #     flow = flow_viz.flow_to_image(flow)
                     #     cv2.imwrite(f"flow_preds_{i}.png", flow)
                     B, C, H, W = flow_gt.shape
                     # valid = torch.ones_like()
                     valid = torch.ones(B, H, W).to(self.device)
                     loss, metrics = flow_loss_func(flow_preds, flow_gt, valid, self.args.max_flow)
+
+                # x = input()
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)

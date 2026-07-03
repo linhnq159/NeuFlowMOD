@@ -215,10 +215,12 @@ class DataU3GiamChan(FlowDataset):
         print("root : ", root)
         image_dirs = osp.join(root, 'training', 'clean')
 
-        image_root = image_dirs
+        # image_root = image_dirs
+
+        image_root = root
 
         for scene in os.listdir(image_root):
-            image_list = sorted(glob(osp.join(image_root, scene, '*.png')))
+            image_list = sorted(glob(osp.join(image_root, scene, '*.png'))) + sorted(glob(osp.join(image_root, scene, '*.jpg')))
 
             for i in range(len(image_list) - 1):
                 self.image_list += [[image_list[i], image_list[i + 1]]]
@@ -678,9 +680,10 @@ def build_train_dataset(stage, val_ratio = 0.2):
         train_dataset = things_clean + things_final + 2 * neu_dataset
 
     elif stage == 'custom':
+        root = "/data/linhnq11/Data/U3/Video_co_giam_chan/img"
         crop_size = (544, 960)
         aug_params = {'crop_size': crop_size, 'min_scale': -0.4, 'max_scale': 0.8, 'do_flip': True, 'resize_or_crop_mode': 'random'}
-        dataU3_dataset = DataU3GiamChan(aug_params)
+        dataU3_dataset = DataU3GiamChan(aug_params, root)
 
         # Split train/val
         n_total = len(dataU3_dataset)
