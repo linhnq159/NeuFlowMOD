@@ -9,7 +9,7 @@ from data_utils import datasets
 
 from data_utils import frame_utils
 from data_utils import flow_viz
-
+import tqdm
 
 @torch.no_grad()
 def validate_chairs(model, device):
@@ -175,7 +175,8 @@ def validate_U3_giam_chan(model,
     print('Number of validation image pairs: %d' % len(val_dataset))
     epe_list = []
 
-    for val_id in range(len(val_dataset)):
+    # tbar = tqdm(val_dataset)
+    for val_id, val_dataset_ in enumerate(val_dataset):
         
         image1, image2, _, _ = val_dataset[val_id]
 
@@ -209,10 +210,15 @@ def validate_U3_giam_chan(model,
         epe = torch.sum((flow - flow_gt) ** 2, dim=0).sqrt()
         epe_list.append(epe.view(-1).numpy())
 
+        # tbar.set_description('epe:%f'
+        #                         % (np.mean(np.concatenate(epe_list))))
+
     epe_all = np.concatenate(epe_list)
     epe = np.mean(epe_all)
 
     results[dstype + '_epe'] = np.mean(epe_list)
+
+    print("Validation U3 dataset (%s) EPE: %.3f" % (dstype, epe))
 
     return results
 

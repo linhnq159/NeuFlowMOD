@@ -12,7 +12,7 @@ from load_model import my_load_weights, my_freeze_model
 import os
 from data_utils import flow_viz
 import cv2
-
+from tqdm import tqdm
 
 class DistillationTrainer:
     """Train NeuFlowV2 using SEA-RAFT as teacher model."""
@@ -139,8 +139,9 @@ class DistillationTrainer:
             if self.args.distributed:
                 self.train_sampler.set_epoch(epoch)
 
-            for i, sample in enumerate(self.train_loader):
-                print(f"epoch :{epoch}, sample {i}")
+            tbar = tqdm(self.train_loader)
+            for i, sample in enumerate(tbar):
+                # print(f"epoch :{epoch}, sample {i}")
                 optimizer.zero_grad()
 
                 img1, img2, _, _ = [x.to(self.device) for x in sample]
@@ -196,7 +197,7 @@ class DistillationTrainer:
 
                 scaler.update()
 
-                print(f"total_steps : {total_steps}, epe : {round(metrics['epe'], 3)}, mag : {round(metrics['mag'], 3)}, lr : {optimizer.param_groups[-1]['lr']}, loss : {loss}")
+                # print(f"total_steps : {total_steps}, epe : {round(metrics['epe'], 3)}, mag : {round(metrics['mag'], 3)}, lr : {optimizer.param_groups[-1]['lr']}, loss : {loss}")
 
                 total_steps += 1
 
@@ -256,6 +257,9 @@ class DistillationTrainer:
                             f.write('\n\n')
 
                     self.student.train()
+
+                tbar.set_description('Epoch:%3d, step %6d,  lr:%.6f, epe:%f, mag:%f, loss:%f' 
+                                 % (epoch, total_steps, optimizer.param_groups[-1]['lr'], round(metrics['epe'], 3), round(metrics['mag'], 3), loss))
 
             epoch += 1
 
