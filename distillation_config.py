@@ -2,9 +2,12 @@
 
 DISTILLATION_CONFIG = {
     # Model paths
-    'neuflow_checkpoint': './checkpoints/neuflowv2.pth',
-    'searaft_checkpoint': '../SEA-RAFT/checkpoints/searaft.pth',
-    
+    'model_teacher' : 'SEARAFT', # Option SEARAFT, FlowFormerPlusPlus, FlowDiffuser, gmflow
+    'neuflow_checkpoint': '/data/linhnq11/OpticalFlow/NeuFlow/neuflow_things.pth',
+    'searaft_checkpoint': '/data/linhnq11/MOD/SEA-RAFT/SEA-RAFT-models/Tartan-C-T-TSKH-spring540x960-M.pth',
+    'searaft_config': '/data/linhnq11/MOD/SEA-RAFT/config/eval/sintel-L.json',
+
+
     # Loss weights
     'alpha': 0.7,  # Weight for distillation loss (1-alpha for task loss)
     'temperature': 4.0,  # Temperature for softening distributions
@@ -21,7 +24,7 @@ DISTILLATION_CONFIG = {
     
     # Training
     'batch_size': 32,
-    'num_epochs': 400,
+    'num_epochs': 1,
     'num_workers': 8,
     'log_interval': 10,
     'save_interval': 10,
@@ -29,5 +32,6 @@ DISTILLATION_CONFIG = {
     # Data
     'train_data_root': './data/FlyingChairs',
     'val_data_root': './data/validation',
-    'image_size': (384, 512),  # (height, width)
+    # 'image_size': (384, 512),  # (height, width)
+    'image_size': (544, 960),  # (height, width)
 }

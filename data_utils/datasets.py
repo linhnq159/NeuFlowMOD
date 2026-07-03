@@ -10,7 +10,7 @@ from glob import glob
 import os.path as osp
 
 from data_utils import frame_utils
-from data_utils.transforms import FlowAugmentor, SparseFlowAugmentor
+from data_utils.transforms import FlowAugmentor, SparseFlowAugmentor, ImageOnlyAugmentor
 
 
 class FlowDataset(data.Dataset):
@@ -166,6 +166,140 @@ class FlowDataset(data.Dataset):
 
 #                 if load_occlusion:
 #                     self.occ_list += sorted(glob(osp.join(occlusion_root, scene, '*.png')))
+
+
+class Custom(FlowDataset):
+    def __init__(self, aug_params=None, split='training',
+                 root='datasets/Sintel',
+                 dstype='clean',
+                 load_occlusion=False,
+                 ):
+        super(MpiSintel, self).__init__(aug_params,
+                                        load_occlusion=load_occlusion,
+                                        )
+
+        flow_root = osp.join(root, split, 'flow')
+        image_root = osp.join(root, split, dstype)
+
+        if load_occlusion:
+            occlusion_root = osp.join(root, split, 'occlusions')
+
+        if split == 'test':
+            self.is_test = True
+
+        print("split : ", split)
+
+        for scene in os.listdir(image_root):
+            image_list = sorted(glob(osp.join(image_root, scene, '*.png')))
+
+            for i in range(len(image_list) - 1):
+                self.image_list += [[image_list[i], image_list[i + 1]]]
+                self.extra_info += [(scene, i)]  # scene and frame_id
+
+            if split != 'test':
+                self.flow_list += sorted(glob(osp.join(flow_root, scene, '*.flo')))
+
+                if load_occlusion:
+                    self.occ_list += sorted(glob(osp.join(occlusion_root, scene, '*.png')))
+
+
+class DataU3GiamChan(FlowDataset):
+    def __init__(self, aug_params=None, root='datasets/Sintel', split='train', val_ratio=0.1):
+        super(DataU3GiamChan, self).__init__(aug_params=None)
+
+        # Create new augmentor
+        if aug_params is not None:
+            self.augmentor = ImageOnlyAugmentor(**aug_params)
+
+        # Read list image
+        print("root : ", root)
+        image_dirs = osp.join(root, 'training', 'clean')
+
+        image_root = image_dirs
+
+        for scene in os.listdir(image_root):
+            image_list = sorted(glob(osp.join(image_root, scene, '*.png')))
+
+            for i in range(len(image_list) - 1):
+                self.image_list += [[image_list[i], image_list[i + 1]]]
+                self.extra_info += [(scene, i)]  # scene and frame_id
+
+    def __getitem__(self, index):
+
+        if self.is_test:
+            img1 = frame_utils.read_gen(self.image_list[index][0])
+            img2 = frame_utils.read_gen(self.image_list[index][1])
+
+            img1 = np.array(img1).astype(np.uint8)[..., :3]
+            img2 = np.array(img2).astype(np.uint8)[..., :3]
+
+            img1 = torch.from_numpy(img1).permute(2, 0, 1).float()
+            img2 = torch.from_numpy(img2).permute(2, 0, 1).float()
+
+            return img1, img2, self.extra_info[index]
+
+        if not self.init_seed:
+            worker_info = torch.utils.data.get_worker_info()
+            if worker_info is not None:
+                torch.manual_seed(worker_info.id)
+                np.random.seed(worker_info.id)
+                random.seed(worker_info.id)
+                self.init_seed = True
+
+        index = index % len(self.image_list)
+        valid = None
+
+        # if self.sparse:
+        #     if self.virtual:
+        #         flow, valid = frame_utils.read_vkitti_png_flow(self.flow_list[index])  # [H, W, 2], [H, W]
+        #     else:
+        #         flow, valid = frame_utils.readFlowKITTI(self.flow_list[index])  # [H, W, 2], [H, W]
+        # else:
+        #     flow = frame_utils.read_gen(self.flow_list[index])
+
+        img1 = frame_utils.read_gen(self.image_list[index][0])
+        img2 = frame_utils.read_gen(self.image_list[index][1])
+
+        img1 = np.array(img1).astype(np.uint8)
+        img2 = np.array(img2).astype(np.uint8)
+
+        # grayscale images
+        if len(img1.shape) == 2:
+            img1 = np.tile(img1[..., None], (1, 1, 3))
+            img2 = np.tile(img2[..., None], (1, 1, 3))
+        else:
+            img1 = img1[..., :3]
+            img2 = img2[..., :3]
+
+        if self.augmentor is not None:
+            img1, img2 = self.augmentor(img1, img2)
+
+        img1 = torch.from_numpy(img1).permute(2, 0, 1).float()
+        img2 = torch.from_numpy(img2).permute(2, 0, 1).float()
+
+        # if valid is not None:
+        #     valid = torch.from_numpy(valid)
+        # else:
+        #     valid = (flow[0].abs() < 1000) & (flow[1].abs() < 1000)
+
+        # mask out occluded pixels
+        if self.load_occlusion:
+            # non-occlusion: 0, occlusion: 255
+            noc_valid = 1 - occlusion / 255.  # 0 or 1
+
+            return img1, img2, 1, 1
+
+        return img1, img2, 1, 1
+
+    def __rmul__(self, v):
+        self.flow_list = v * self.flow_list
+        self.image_list = v * self.image_list
+        self.occ_list = v * self.occ_list
+
+        return self
+
+    def __len__(self):
+        return len(self.image_list)
 
 
 class MpiSintel(FlowDataset):
@@ -392,8 +526,62 @@ class NeuSim(FlowDataset):
                 self.image_list += [[images[i + 1], images[i]]]
                 self.flow_list += [bw_flows[i]]
 
+class FlyingThings3D(FlowDataset):
+    def __init__(self, aug_params=None,
+                 root='datasets/FlyingThings3D',
+                 dstype='frames_cleanpass',
+                 test_set=False,
+                 validate_subset=False,
+                 only_left=True,
+                 ):
+        super(FlyingThings3D, self).__init__(aug_params)
 
-def build_train_dataset(stage):
+        img_dir = root
+        flow_dir = root
+
+        if only_left:
+            cam_list = ['left']
+        else: 
+            cam_list = ['left', 'right']
+
+        for cam in cam_list:
+            for direction in ['into_future', 'into_past']:
+                if test_set:
+                    image_dirs = sorted(glob(osp.join(img_dir, dstype, 'TEST/*/*')))
+                else:
+                    image_dirs = sorted(glob(osp.join(img_dir, dstype, 'TRAIN/*/*')))
+                image_dirs = sorted([osp.join(f, cam) for f in image_dirs])
+
+                if test_set:
+                    flow_dirs = sorted(glob(osp.join(flow_dir, 'optical_flow/TEST/*/*')))
+                else:
+                    flow_dirs = sorted(glob(osp.join(flow_dir, 'optical_flow/TRAIN/*/*')))
+                flow_dirs = sorted([osp.join(f, direction, cam) for f in flow_dirs])
+
+                for idir, fdir in zip(image_dirs, flow_dirs):
+                    images = sorted(glob(osp.join(idir, '*.npy')))
+                    flows = sorted(glob(osp.join(fdir, '*.npy')))
+                    for i in range(len(flows) - 1):
+                        if direction == 'into_future':
+                            self.image_list += [[images[i], images[i + 1]]]
+                            self.flow_list += [flows[i]]
+                        elif direction == 'into_past':
+                            self.image_list += [[images[i + 1], images[i]]]
+                            self.flow_list += [flows[i + 1]]
+
+        # if test_set and validate_subset:
+        if validate_subset:
+            num_val_samples = 1024
+            all_test_samples = len(self.image_list)  # 7866
+
+            stride = all_test_samples // num_val_samples
+            remove = all_test_samples % num_val_samples
+
+            self.image_list = self.image_list[:-remove][::stride]
+            self.flow_list = self.flow_list[:-remove][::stride]
+
+
+def build_train_dataset(stage, val_ratio = 0.2):
     if stage == 'chairs':
         aug_params = {'crop_size': (384, 512), 'min_scale': -0.1, 'max_scale': 1.0, 'do_flip': True}
 
@@ -428,14 +616,13 @@ def build_train_dataset(stage):
 
     elif stage == 'sintel':
         crop_size = (368, 768)
+        # crop_size = (540, 960)
         aug_params = {'crop_size': crop_size, 'min_scale': -0.2, 'max_scale': 0.6, 'do_flip': True}
 
         things_clean = FlyingThings3D(aug_params, dstype='frames_cleanpass')
 
         sintel_clean = MpiSintel(aug_params, split='training', dstype='clean')
         sintel_final = MpiSintel(aug_params, split='training', dstype='final')
-
-        print("sintel_clean : ", len(sintel_clean))
 
         aug_params = {'crop_size': crop_size, 'min_scale': -0.3, 'max_scale': 0.5, 'do_flip': True}
 
@@ -490,4 +677,23 @@ def build_train_dataset(stage):
 
         train_dataset = things_clean + things_final + 2 * neu_dataset
 
-    return train_dataset
+    elif stage == 'custom':
+        crop_size = (544, 960)
+        aug_params = {'crop_size': crop_size, 'min_scale': -0.4, 'max_scale': 0.8, 'do_flip': True, 'resize_or_crop_mode': 'random'}
+        dataU3_dataset = DataU3GiamChan(aug_params)
+
+        # Split train/val
+        n_total = len(dataU3_dataset)
+        n_val = int(n_total * val_ratio)
+        n_train = n_total - n_val
+
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            dataU3_dataset, [n_train, n_val],
+            generator=torch.Generator().manual_seed(42)
+        )
+
+        # train_dataset = dataU3_dataset
+        return train_dataset, val_dataset
+
+    val_dataset = None
+    return train_dataset, val_dataset

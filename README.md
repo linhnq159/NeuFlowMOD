@@ -107,6 +107,9 @@ python -m torch.distributed.launch --nproc_per_node=8 --master_port=29501 train.
 --distributed
 ```
 
+
+python train_distillation.py --checkpoint_dir experiment/16062026_resume/ --stage sintel --val_dataset sintel --batch_size 32 --num_workers 4 --lr 1e-4 --val_freq 1000 --resume experiment/16062026/step_002000.pth --strict_resume --lr 0.0001
+
 ## Evaluation
 
 ```

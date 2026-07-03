@@ -3,3 +3,8 @@ __pycache__/
 /test_results
 *.pth
 experiment/
+
+*.jpg
+*.png
+test*
+.codex

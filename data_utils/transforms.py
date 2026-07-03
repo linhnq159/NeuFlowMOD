@@ -6,8 +6,7 @@ import torch
 
 class FlowAugmentor:
     def __init__(self, crop_size, min_scale=-0.2, max_scale=0.5, do_flip=True,
-                 no_eraser_aug=False,
-                 ):
+                 no_eraser_aug=False, resize_or_crop_mode='crop'):
         # spatial augmentation params
         self.crop_size = crop_size
         self.min_scale = min_scale
@@ -302,3 +301,123 @@ class SparseFlowAugmentor:
         valid = np.ascontiguousarray(valid)
 
         return img1, img2, flow, valid
+
+class ImageOnlyAugmentor:
+    def __init__(self, crop_size, min_scale=-0.2, max_scale=0.5, do_flip=True,
+                 no_eraser_aug=False, resize_or_crop_mode = 'crop'
+                 ):
+        # spatial augmentation params
+        self.crop_size = crop_size
+        self.min_scale = min_scale
+        self.max_scale = max_scale
+        self.spatial_aug_prob = 0.8
+        self.stretch_prob = 0.8
+        self.max_stretch = 0.2
+
+        # flip augmentation params
+        self.do_flip = do_flip
+        self.h_flip_prob = 0.5
+        self.v_flip_prob = 0.1
+
+        # photometric augmentation params
+        self.photo_aug = ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4)
+
+        self.asymmetric_color_aug_prob = 0.2
+        self.eraser_aug_prob = -1 if no_eraser_aug else 0.5
+        self.resize_or_crop_mode = resize_or_crop_mode  # 'crop' | 'resize' | 'random'
+
+    def color_transform(self, img1, img2):
+        """ Photometric augmentation """
+        if np.random.rand() < self.asymmetric_color_aug_prob:
+            img1 = np.array(self.photo_aug(Image.fromarray(img1)), dtype=np.uint8)
+            img2 = np.array(self.photo_aug(Image.fromarray(img2)), dtype=np.uint8)
+        else:
+            image_stack = np.concatenate([img1, img2], axis=0)
+            image_stack = np.array(self.photo_aug(Image.fromarray(image_stack)), dtype=np.uint8)
+            img1, img2 = np.split(image_stack, 2, axis=0)
+        return img1, img2
+
+    def eraser_transform(self, img1, img2, bounds=[50, 100]):
+        """ Occlusion augmentation """
+        ht, wd = img1.shape[:2]
+        if np.random.rand() < self.eraser_aug_prob:
+            mean_color = np.mean(img2.reshape(-1, 3), axis=0)
+            for _ in range(np.random.randint(1, 3)):
+                x0 = np.random.randint(0, wd)
+                y0 = np.random.randint(0, ht)
+                dx = np.random.randint(bounds[0], bounds[1])
+                dy = np.random.randint(bounds[0], bounds[1])
+                img2[y0:y0 + dy, x0:x0 + dx, :] = mean_color
+        return img1, img2
+
+    def spatial_transform(self, img1, img2):
+        if self.resize_or_crop_mode == 'random':
+            use_resize = np.random.rand() < 0.5
+        else:
+            use_resize = self.resize_or_crop_mode == 'resize'
+
+        if use_resize:
+            # Resize to crop_size
+            img1 = cv2.resize(img1, self.crop_size[::-1], interpolation=cv2.INTER_LINEAR)
+            img2 = cv2.resize(img2, self.crop_size[::-1], interpolation=cv2.INTER_LINEAR)
+        else:
+            # Padding + crop logic
+            h, w = img1.shape[:2]
+            target_h, target_w = self.crop_size
+
+            # calculate padding
+            pad_top = max(0, (target_h - h) // 2)
+            pad_bottom = max(0, target_h - h - pad_top)
+            pad_left = max(0, (target_w - w) // 2)
+            pad_right = max(0, target_w - w - pad_left)
+
+            # Padding 
+            if pad_top > 0 or pad_bottom > 0 or pad_left > 0 or pad_right > 0:
+                img1 = np.pad(img1, ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)), 
+                             mode='constant', constant_values=0)
+                img2 = np.pad(img2, ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)), 
+                             mode='constant', constant_values=0)
+
+            # after padding, random crop
+            padded_h, padded_w = img1.shape[:2]
+            if padded_h - target_h > 0:
+                y0 = np.random.randint(0, padded_h - target_h)
+            else:
+                y0 = 0
+            if padded_w - target_w > 0:
+                x0 = np.random.randint(0, padded_w - target_w)
+            else:
+                x0 = 0
+
+            img1 = img1[y0:y0 + target_h, x0:x0 + target_w]
+            img2 = img2[y0:y0 + target_h, x0:x0 + target_w]
+
+            # ensure contiguous
+            img1 = np.ascontiguousarray(img1)
+            img2 = np.ascontiguousarray(img2)
+
+        return img1, img2
+
+    def safe_pad_or_crop(self, img, target_size):
+        h, w = img.shape[:2]
+        th, tw = target_size
+        out = np.zeros((th, tw, img.shape[2]), dtype=img.dtype)
+        y_start = max(0, (th - h) // 2)
+        x_start = max(0, (tw - w) // 2)
+        out[y_start:y_start+h, x_start:x_start+w] = img
+        # return out
+        return np.ascontiguousarray(out)
+
+    def __call__(self, img1, img2):
+        img1, img2 = self.color_transform(img1, img2)
+        img1, img2 = self.eraser_transform(img1, img2)
+        img1, img2 = self.spatial_transform(img1, img2)
+
+        img1 = np.ascontiguousarray(img1)
+        img2 = np.ascontiguousarray(img2)
+
+        return img1, img2
+
+def is_contiguous(arr):
+    """Return True if `arr` is contiguous in either C or Fortran order."""
+    return arr.flags['C_CONTIGUOUS'] or arr.flags['F_CONTIGUOUS']

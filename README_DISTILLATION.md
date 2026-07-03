@@ -67,3 +67,7 @@ Checkpoints are saved in `./checkpoints/distillation/`:
    - Lower α: More emphasis on ground truth
 3. Start with temperature=4.0, adjust if needed
 4. Monitor both task loss and distillation loss during training
+
+
+## Exp:
+python train_distillation.py --checkpoint_dir experiment/16062026_resume/ --stage custom --val_dataset U3_giam_chan --batch_size 32 --num_workers 4 --lr 1e-4 --val_freq 1000 --resume experiment/16062026/step_002000.pth --strict_resume --lr 0.0001

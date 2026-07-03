@@ -25,7 +25,7 @@ def get_args_parser():
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--batch_size', default=32, type=int)
     parser.add_argument('--num_workers', default=8, type=int)
-    parser.add_argument('--val_freq', default=1000, type=int)
+    parser.add_argument('--val_freq', default=1000, type=int) ### default 1000
     parser.add_argument('--num_steps', default=1000000, type=int)
 
     parser.add_argument('--max_flow', default=400, type=int)
