@@ -24,7 +24,7 @@ DISTILLATION_CONFIG = {
     
     # Training
     'batch_size': 32,
-    'num_epochs': 1,
+    'num_epochs': 100,
     'num_workers': 8,
     'log_interval': 10,
     'save_interval': 10,

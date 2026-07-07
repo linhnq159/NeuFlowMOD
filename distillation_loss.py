@@ -4,41 +4,47 @@ import torch.nn.functional as F
 
 
 class DistillationLoss(nn.Module):
-    """
-    Combines task loss with knowledge distillation loss.
-    Student (NeuFlowV2) learns from teacher (SEA-RAFT) predictions.
-    """
-    def __init__(self, temperature=4.0, alpha=0.7):
-        """
-        Args:
-            temperature: Temperature for softening probability distributions
-            alpha: Weight for distillation loss (1-alpha for task loss)
-        """
+    def __init__(self, temperature=4.0, alpha=0.7, gamma=0.9):
         super().__init__()
-        self.temperature = temperature
+        self.T = temperature
         self.alpha = alpha
+        self.gamma = gamma  # trọng số giảm theo tầng
+        self.task_loss_fn = CharbonnierLoss()
 
-    def forward(self, student_output, teacher_output, ground_truth, task_loss_fn):
+    def forward(self, student_preds, teacher_flow, valid):
         """
         Args:
-            student_output: NeuFlowV2 predictions (B, 2, H, W)
-            teacher_output: SEA-RAFT predictions (B, 2, H, W)
-            ground_truth: Ground truth flow (B, 2, H, W)
-            task_loss_fn: Function to compute task loss (e.g., EPE, Charbonnier)
-        
+            student_preds: list các tensor [B, 2, H, W]
+            teacher_flow: tensor [B, 2, H, W]
+            valid: tensor [B, H, W] (không dùng trong CharbonnierLoss, nhưng giữ để đồng nhất API)
         Returns:
-            Total loss
+            total_loss, task_loss, distill_loss
         """
-        # Task loss (student predicting ground truth)
-        task_loss = task_loss_fn(student_output, ground_truth)
-        
-        # KL divergence loss (distillation)
-        kl_loss = self._kl_divergence_loss(student_output, teacher_output)
-        
-        # Combined loss
-        total_loss = (1 - self.alpha) * task_loss + self.alpha * kl_loss
-        
-        return total_loss, task_loss, kl_loss
+        n_predictions = len(student_preds)
+        task_loss = 0.0
+        distill_loss = 0.0
+
+        for i, student_flow in enumerate(student_preds):
+            # Trọng số giảm theo tầng (giống flow_loss_func)
+            i_weight = self.gamma ** (n_predictions - i - 1)
+
+            # Task loss: student vs teacher (không dùng valid)
+            i_task_loss = self.task_loss_fn(student_flow, teacher_flow)
+            task_loss += i_weight * i_task_loss
+
+            # # Distillation loss: KL divergence giữa soft targets
+            # soft_student = F.log_softmax(student_flow / self.T, dim=1)  # [B, 2, H, W]
+            # soft_teacher = F.softmax(teacher_flow / self.T, dim=1)      # [B, 2, H, W]
+            # i_distill_loss = F.kl_div(soft_student, soft_teacher, reduction='batchmean') * (self.T ** 2)
+            i_distill_loss = self._kl_divergence_loss(student_flow, teacher_flow)
+            distill_loss += i_weight * i_distill_loss
+            # distill_loss = 0
+
+        # Total loss: (1 - alpha) * task_loss + alpha * distill_loss
+        total_loss = (1 - self.alpha) * task_loss + self.alpha * distill_loss
+        # total_loss = task_loss
+
+        return total_loss, task_loss, distill_loss
 
     def _kl_divergence_loss(self, student_flow, teacher_flow):
         """

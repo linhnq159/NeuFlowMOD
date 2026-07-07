@@ -3,6 +3,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from pathlib import Path
 import logging
+import torch.nn.functional as F
 
 from distillation_loss import DistillationLoss, CharbonnierLoss
 from loss import flow_loss_func
@@ -13,6 +14,7 @@ import os
 from data_utils import flow_viz
 import cv2
 from tqdm import tqdm
+import numpy as np 
 
 class DistillationTrainer:
     """Train NeuFlowV2 using SEA-RAFT as teacher model."""
@@ -34,7 +36,7 @@ class DistillationTrainer:
         self.config = config
         self.args = args
         self.use_fp16 = use_fp16
-        
+
         # Freeze teacher model
         for param in self.teacher.parameters():
             param.requires_grad = False
@@ -64,6 +66,11 @@ class DistillationTrainer:
             gamma=config.get('lr_gamma', 0.1)
         )
         
+        # State variables
+        self.total_steps = 0
+        self.epoch = 0
+        self.counter = 0
+        
         self.logger = self._setup_logger()
 
     def _setup_logger(self):
@@ -78,12 +85,17 @@ class DistillationTrainer:
         logger.setLevel(logging.INFO)
         return logger
 
-    def train_epoch(self, epoch):
+    def train_epoch(self, number_epoch_training):
+        loss_file = os.path.join(self.args.checkpoint_dir, 'loss.txt')
+
+        # Wrap DDP 1 lần duy nhất
         if self.args.distributed:
-            self.student = torch.nn.parallel.DistributedDataParallel(
-                self.student,
-                device_ids=[self.args.local_rank],
-                output_device=self.args.local_rank)
+            if not isinstance(self.student, torch.nn.parallel.DistributedDataParallel):
+                self.student = torch.nn.parallel.DistributedDataParallel(
+                    self.student,
+                    device_ids=[self.args.local_rank],
+                    output_device=self.args.local_rank
+                )
             self.model_without_ddp = self.student.module
         else:
             self.model_without_ddp = self.student
@@ -91,81 +103,79 @@ class DistillationTrainer:
         num_params = sum(p.numel() for p in self.student.parameters())
         print('Number of params:', num_params)
 
-        scaler = torch.cuda.amp.GradScaler(enabled = self.use_fp16)
-        optimizer = torch.optim.AdamW(self.model_without_ddp.parameters(), lr=self.args.lr,
-                                    weight_decay=1e-4)
+        scaler = torch.cuda.amp.GradScaler(enabled=self.use_fp16)
 
-        start_step = 0
-        
-        total_steps = 0
-        epoch = 0
-        counter = 0
-
-        if self.args.resume :
+        # Resume checkpoint
+        if self.args.resume:
+            checkpoint_path = self.args.resume
             state_dict = my_load_weights(self.args.resume)
 
             self.model_without_ddp.load_state_dict(state_dict, strict=self.args.strict_resume)
-
+            
+            # Load optimizer state nếu có
+            if 'optimizer' in state_dict:
+                self.optimizer.load_state_dict(state_dict['optimizer'])
+            
+            # Load epoch/total_steps nếu có
+            if 'epoch' in state_dict:
+                self.epoch = state_dict['epoch']
+            if 'total_steps' in state_dict:
+                self.total_steps = state_dict['total_steps']
+            
             my_freeze_model(self.student)
 
-            # for name, param in model.named_parameters():
-            #     print(name, param.requires_grad)
-
             torch.save({
-                'model': self.model_without_ddp.state_dict()
+                'model': self.model_without_ddp.state_dict(),
+                'total_steps': self.total_steps,
+                'epoch': self.epoch,
+                'optimizer': self.optimizer.state_dict(),
             }, os.path.join(self.args.checkpoint_dir, 'step_0.pth'))
 
-        elif self.config['neuflow_checkpoint']:
-
-            state_dict = my_load_weights(self.config['neuflow_checkpoint'])
-
-            self.model_without_ddp.load_state_dict(state_dict, strict=self.args.strict_resume)
-
-            my_freeze_model(self.student)
-
-            # for name, param in model.named_parameters():
-            #     print(name, param.requires_grad)
-
-            torch.save({
-                'model': self.model_without_ddp.state_dict()
-            }, os.path.join(self.args.checkpoint_dir, 'step_0.pth'))
-
-        while total_steps < self.args.num_steps:
+        while self.total_steps < self.args.num_steps and self.epoch < number_epoch_training:
             """Train for one epoch."""
             self.student.train()
             self.teacher.eval()
+            list_loss = []
+            list_epe = []
 
             # manual change random seed for shuffling every epoch
             if self.args.distributed:
-                self.train_sampler.set_epoch(epoch)
+                self.train_sampler.set_epoch(self.epoch)
 
-            tbar = tqdm(self.train_loader)
+            tbar = tqdm(self.train_loader, desc=f"Epoch {self.epoch}", dynamic_ncols=True, disable=self.args.local_rank != 0)
+            # tbar = tqdm(self.train_loader, desc=f"Epoch {self.epoch}", disable=self.args.local_rank != 0)
+            # tbar = tqdm(self.train_loader, disable=self.args.local_rank != 0)
             for i, sample in enumerate(tbar):
-                # print(f"epoch :{epoch}, sample {i}")
-                optimizer.zero_grad()
+
+            # for i, sample in enumerate(self.train_loader):
+                self.optimizer.zero_grad()
 
                 img1, img2, _, _ = [x.to(self.device) for x in sample]
 
                 # img1 = img1.half()
                 # img2 = img2.half()
 
-                img1 = img1.float()
-                img2 = img2.float()
+                # img1 = img1.float()
+                # img2 = img2.float()
 
                 # Teacher prediction (no grad)
                 with torch.no_grad():
                     teacher_flow = self.teacher(img1.contiguous(), img2.contiguous())
-                    flow_gt = teacher_flow
                     # for i in range(teacher_flow.shape[0]):
                     #     flow = teacher_flow[i].permute(1,2,0).cpu().detach().numpy()
                     #     print(f"flow_teacher_{i} : {flow}")
                     #     flow = flow_viz.flow_to_image(flow)
                     #     cv2.imwrite(f"teacher_flow_{i}.png", flow)
                     
-                self.model_without_ddp.init_bhwd(img1.shape[0], img1.shape[-2], img1.shape[-1], self.device)
+                    # print("teacher_flow : ", teacher_flow)
+                    # Tạo valid từ teacher flow
+                    mag = torch.sum(teacher_flow ** 2, dim=1).sqrt()
+                    valid = (mag < self.args.max_flow).float()  # [B, H, W]
+                self.model_without_ddp.init_bhwd(img1.shape[0], img1.shape[-2], img1.shape[-1], self.device, amp = True)
 
                 with torch.cuda.amp.autocast(enabled=True):
                     flow_preds = self.student(img1, img2, iters_s16=4, iters_s8=7)
+                    # print("flow_preds : ", flow_preds[-1])
                     # for i in range((flow_preds[-1]).shape[0]):
                     #     flow = flow_preds[-1][i].permute(1,2,0).cpu().detach().numpy()
                     #     print(f"flow_preds_{i} : {flow}")
@@ -173,15 +183,28 @@ class DistillationTrainer:
                     #     # print(f"flow_teacher_{i} : {flow}")
                     #     flow = flow_viz.flow_to_image(flow)
                     #     cv2.imwrite(f"flow_preds_{i}.png", flow)
-                    B, C, H, W = flow_gt.shape
+                    
+                    loss, task_loss, distill_loss = self.distill_loss_fn(
+                        flow_preds, teacher_flow, valid
+                    )
+
+                    # B, C, H, W = teacher_flow.shape
                     # valid = torch.ones_like()
-                    valid = torch.ones(B, H, W).to(self.device)
-                    loss, metrics = flow_loss_func(flow_preds, flow_gt, valid, self.args.max_flow)
+                    # valid = torch.ones(B, H, W).to(self.device)
+                    _, metrics = flow_loss_func(flow_preds, teacher_flow, valid, self.args.max_flow)
+                    list_loss.append(loss.item())
+                    list_epe.append(metrics['epe'])
 
                 # x = input()
 
+                with open(loss_file, 'a') as f1:
+                    f1.write('epoch %3d, step: %06d, lr: %.6f, loss: %.6f\n' % (self.epoch, self.total_steps, self.optimizer.param_groups[-1]['lr'], loss))
+
+                # print("task_loss : ", task_loss)
+                # print("distill_loss : ", distill_loss)
+
                 scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
+                scaler.unscale_(self.optimizer)
 
                 bad_grad = False
                 for name, param in self.student.named_parameters():
@@ -191,77 +214,104 @@ class DistillationTrainer:
                         print(name, param.grad.mean().item())
                     # print(name, torch.max(torch.abs(param.grad)).item())
 
+                # bad_grad = False
+                # for name, param in self.student.named_parameters():
+                #     if param.grad is None:
+                #         continue
+
+                #     if not torch.all(torch.isfinite(param.grad)):
+                #         bad_grad = True
+                #         # print(name, param.grad.mean().item())
+                #     # print(name, torch.max(torch.abs(param.grad)).item())
+
+                # # print(f"epe_mean : {round(metrics['epe'], 3)}, loss : {loss}")
+
+                # if bad_grad:
+                #     self.logger.warning("Skipping update due to non-finite gradients.")
+                #     self.optimizer.zero_grad(set_to_none = True)
+                #     scaler.update()
+                #     continue
+
                 torch.nn.utils.clip_grad_norm_(self.student.parameters(), 1.0)
-
-                scaler.step(optimizer)
-
+                scaler.step(self.optimizer)
                 scaler.update()
 
-                # print(f"total_steps : {total_steps}, epe : {round(metrics['epe'], 3)}, mag : {round(metrics['mag'], 3)}, lr : {optimizer.param_groups[-1]['lr']}, loss : {loss}")
+                self.total_steps += 1
 
-                total_steps += 1
-
-                if total_steps % self.args.val_freq == 0:
-
-                    if self.args.local_rank == 0:
-                        checkpoint_path = os.path.join(self.args.checkpoint_dir, 'step_%06d.pth' % total_steps)
-                        torch.save({
-                            'model': self.model_without_ddp.state_dict()
-                        }, checkpoint_path)
-
-                    val_results = {}
-
-                    if 'things' in self.args.val_dataset:
-                        test_results_dict = validate_things(self.model_without_ddp, device, dstype='frames_cleanpass', validate_subset=True)
-                        if self.args.local_rank == 0:
-                            val_results.update(test_results_dict)
-
-                    if 'sintel' in self.args.val_dataset:
-                        test_results_dict = validate_sintel(self.model_without_ddp, self.device, dstype='final')
-                        if self.args.local_rank == 0:
-                            val_results.update(test_results_dict)
-
-                    if 'kitti' in self.args.val_dataset:
-                        test_results_dict = validate_kitti(self.model_without_ddp, device)
-                        if self.args.local_rank == 0:
-                            val_results.update(test_results_dict)
-
-                    if 'viper' in self.args.val_dataset:
-                        test_results_dict = validate_viper(self.model_without_ddp, device)
-                        if self.args.local_rank == 0:
-                            val_results.update(test_results_dict)
+                # # Tính EPE từ teacher_flow (để logging)
+                # epe = torch.sum((flow_preds[-1] - teacher_flow) ** 2, dim=1).sqrt()
+                # print("epe : ", epe)
+                # print("epe.shape : ", epe.shape)
+                # epe = epe.view(-1)[valid.view(-1).bool()]
+                # print("epe after view: ", epe)
+                # if epe.numel() > 0:
+                #     epe_mean = epe.mean().item()
+                # else:
+                #     epe_mean = 0.0
                 
-                    if 'U3_giam_chan' in self.args.val_dataset:
-                        test_results_dict = validate_U3_giam_chan(model = self.model_without_ddp, teacher_model = self.teacher,  device = self.device, val_dataset = self.val_dataset, dstype='dot1_T32026')
-                        if self.args.local_rank == 0:
-                            val_results.update(test_results_dict)
+                # mag_mean = mag.mean().item()
 
+                # print(f"epe_mean : {round(metrics['epe'], 3)}, loss : {loss}")
+
+                tbar.set_description(f"Epoch:{self.epoch}, step:{self.total_steps}, lr:{self.optimizer.param_groups[-1]['lr']:.6f}, epe:{round(np.mean(list_epe), 3)}, loss:{round(np.mean(list_loss), 3)}")
+
+            if self.total_steps % 1 == 0 and self.epoch % 5 == 0:
+                if self.args.local_rank == 0:
+                    checkpoint_path = os.path.join(self.args.checkpoint_dir, 'epoch_%03d_step_%06d.pth' % (self.epoch, self.total_steps))
+                    torch.save({
+                        'model': self.model_without_ddp.state_dict(),
+                        'total_steps': self.total_steps,
+                        'epoch': self.epoch,
+                        'optimizer': self.optimizer.state_dict(),
+                    }, checkpoint_path)
+
+                val_results = {}
+
+                if 'things' in self.args.val_dataset:
+                    test_results_dict = validate_things(self.model_without_ddp, self.device, dstype='frames_cleanpass', validate_subset=True)
                     if self.args.local_rank == 0:
-                        counter += 1
+                        val_results.update(test_results_dict)
 
-                        if counter >= 10:
+                if 'sintel' in self.args.val_dataset:
+                    test_results_dict = validate_sintel(self.model_without_ddp, self.device, dstype='final')
+                    if self.args.local_rank == 0:
+                        val_results.update(test_results_dict)
 
-                            for group in optimizer.param_groups:
-                                group['lr'] *= 0.8
+                if 'kitti' in self.args.val_dataset:
+                    test_results_dict = validate_kitti(self.model_without_ddp, self.device)
+                    if self.args.local_rank == 0:
+                        val_results.update(test_results_dict)
 
-                            counter = 0
+                if 'viper' in self.args.val_dataset:
+                    test_results_dict = validate_viper(self.model_without_ddp, self.device)
+                    if self.args.local_rank == 0:
+                        val_results.update(test_results_dict)
+                
+                if 'U3_giam_chan' in self.args.val_dataset:
+                    test_results_dict = validate_U3_giam_chan(model=self.model_without_ddp, teacher_model=self.teacher, device=self.device, val_dataset=self.val_dataset, dstype='dot1_T32026')
+                    if self.args.local_rank == 0:
+                        val_results.update(test_results_dict)
 
-                        # Save validation results
-                        val_file = os.path.join(self.args.checkpoint_dir, 'val_results.txt')
-                        with open(val_file, 'a') as f:
-                            f.write('step: %06d lr: %.6f\n' % (total_steps, optimizer.param_groups[-1]['lr']))
+                
+                self.counter += 1
 
-                            for k, v in val_results.items():
-                                f.write("| %s: %.3f " % (k, v))
+                if self.counter >= 10:
+                    for group in self.optimizer.param_groups:
+                        group['lr'] *= 0.8
+                    self.counter = 0
 
-                            f.write('\n\n')
+                if self.args.local_rank == 0:
+                    # Save validation results
+                    val_file = os.path.join(self.args.checkpoint_dir, 'val_results.txt')
+                    with open(val_file, 'a') as f:
+                        f.write('epoch %3d, step: %06d lr: %.6f\n' % (self.epoch, self.total_steps, self.optimizer.param_groups[-1]['lr']))
+                        for k, v in val_results.items():
+                            f.write("| %s: %.3f " % (k, v))
+                        f.write('\n\n')
 
-                    self.student.train()
-
-                tbar.set_description('Epoch:%3d, step %6d,  lr:%.6f, epe:%f, mag:%f, loss:%f' 
-                                 % (epoch, total_steps, optimizer.param_groups[-1]['lr'], round(metrics['epe'], 3), round(metrics['mag'], 3), loss))
-
-            epoch += 1
+                self.student.train()
+            
+            self.epoch += 1
 
     def validate(self, epoch):
         """Validate on validation set."""
@@ -280,7 +330,7 @@ class DistillationTrainer:
                 teacher_flow = self.teacher(img1.contiguous(), img2.contiguous())
                 
                 loss, _, _ = self.distill_loss_fn(
-                    student_flow, teacher_flow, flow_gt, self.task_loss_fn
+                    student_flow, teacher_flow, torch.ones_like(flow_gt[:, 0, :, :]), self.task_loss_fn
                 )
                 
                 total_loss += loss.item()
@@ -298,24 +348,23 @@ class DistillationTrainer:
         
         best_val_loss = float('inf')
         
-        for epoch in range(1, num_epochs + 1):
-            # Train
-            train_loss, task_loss, distill_loss = self.train_epoch(epoch)
-            
-            # Validate
-            val_loss = self.validate(epoch)
-            
-            # Update learning rate
-            self.scheduler.step()
-            
-            # Save checkpoint
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                self._save_checkpoint(checkpoint_dir / 'best_model.pth')
-                self.logger.info(f"Saved best model at epoch {epoch}")
-            
-            if epoch % self.config.get('save_interval', 10) == 0:
-                self._save_checkpoint(checkpoint_dir / f'model_epoch_{epoch}.pth')
+        # Train
+        self.train_epoch(num_epochs)
+        
+        # Validate
+        val_loss = self.validate(self.epoch)
+        
+        # Update learning rate
+        self.scheduler.step()
+        
+        # Save checkpoint
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            self._save_checkpoint(checkpoint_dir / 'best_model.pth')
+            self.logger.info(f"Saved best model at epoch {self.epoch}")
+        
+        if self.epoch % self.config.get('save_interval', 10) == 0:
+            self._save_checkpoint(checkpoint_dir / f'model_epoch_{self.epoch}.pth')
 
     def _save_checkpoint(self, path):
         """Save model checkpoint."""
