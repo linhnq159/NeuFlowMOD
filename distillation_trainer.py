@@ -15,6 +15,7 @@ from data_utils import flow_viz
 import cv2
 from tqdm import tqdm
 import numpy as np 
+from torch.utils.tensorboard import SummaryWriter
 
 class DistillationTrainer:
     """Train NeuFlowV2 using SEA-RAFT as teacher model."""
@@ -36,6 +37,7 @@ class DistillationTrainer:
         self.config = config
         self.args = args
         self.use_fp16 = use_fp16
+        self.period_update_lr = self.args.period_update_lr
 
         # Freeze teacher model
         for param in self.teacher.parameters():
@@ -70,6 +72,9 @@ class DistillationTrainer:
         self.total_steps = 0
         self.epoch = 0
         self.counter = 0
+
+        ## Init tensorboard
+        self.writer = SummaryWriter(log_dir=os.path.join(args.checkpoint_dir, 'logs'))
         
         self.logger = self._setup_logger()
 
@@ -136,6 +141,8 @@ class DistillationTrainer:
             self.student.train()
             self.teacher.eval()
             list_loss = []
+            list_task_loss = []
+            list_distill_loss = []
             list_epe = []
 
             # manual change random seed for shuffling every epoch
@@ -155,11 +162,12 @@ class DistillationTrainer:
                 # img1 = img1.half()
                 # img2 = img2.half()
 
-                # img1 = img1.float()
-                # img2 = img2.float()
+                img1 = img1.float()
+                img2 = img2.float()
 
                 # Teacher prediction (no grad)
                 with torch.no_grad():
+                    # print(f"img1 dtype: {img1.dtype}, device: {img1.device}")
                     teacher_flow = self.teacher(img1.contiguous(), img2.contiguous())
                     # for i in range(teacher_flow.shape[0]):
                     #     flow = teacher_flow[i].permute(1,2,0).cpu().detach().numpy()
@@ -171,9 +179,9 @@ class DistillationTrainer:
                     # Tạo valid từ teacher flow
                     mag = torch.sum(teacher_flow ** 2, dim=1).sqrt()
                     valid = (mag < self.args.max_flow).float()  # [B, H, W]
-                self.model_without_ddp.init_bhwd(img1.shape[0], img1.shape[-2], img1.shape[-1], self.device, amp = True)
+                self.model_without_ddp.init_bhwd(img1.shape[0], img1.shape[-2], img1.shape[-1], self.device, amp = self.use_fp16)
 
-                with torch.cuda.amp.autocast(enabled=True):
+                with torch.cuda.amp.autocast(enabled=self.use_fp16):
                     flow_preds = self.student(img1, img2, iters_s16=4, iters_s8=7)
                     # print("flow_preds : ", flow_preds[-1])
                     # for i in range((flow_preds[-1]).shape[0]):
@@ -183,6 +191,8 @@ class DistillationTrainer:
                     #     # print(f"flow_teacher_{i} : {flow}")
                     #     flow = flow_viz.flow_to_image(flow)
                     #     cv2.imwrite(f"flow_preds_{i}.png", flow)
+
+                    # x = input()
                     
                     loss, task_loss, distill_loss = self.distill_loss_fn(
                         flow_preds, teacher_flow, valid
@@ -193,18 +203,27 @@ class DistillationTrainer:
                     # valid = torch.ones(B, H, W).to(self.device)
                     _, metrics = flow_loss_func(flow_preds, teacher_flow, valid, self.args.max_flow)
                     list_loss.append(loss.item())
+                    list_task_loss.append(task_loss.item())
+                    list_distill_loss.append(distill_loss.item())
                     list_epe.append(metrics['epe'])
 
-                # x = input()
+                
 
                 with open(loss_file, 'a') as f1:
-                    f1.write('epoch %3d, step: %06d, lr: %.6f, loss: %.6f\n' % (self.epoch, self.total_steps, self.optimizer.param_groups[-1]['lr'], loss))
+                    f1.write('epoch %3d, step: %06d, lr: %.6f, loss: %.6f, task_loss: %.6f, distill_loss: %.6f\n' % (self.epoch, self.total_steps, self.optimizer.param_groups[-1]['lr'], loss, task_loss, distill_loss))
 
-                # print("task_loss : ", task_loss)
-                # print("distill_loss : ", distill_loss)
+                self.writer.add_scalar('train/loss', np.mean(list_loss), self.total_steps)
+                self.writer.add_scalar('train/task_loss', np.mean(list_task_loss), self.total_steps)
+                self.writer.add_scalar('train/distill_loss', np.mean(list_distill_loss), self.total_steps)
+                self.writer.add_scalar('train/epe', np.mean(list_epe), self.total_steps)
+                self.writer.add_scalar('train/lr', self.optimizer.param_groups[-1]['lr'], self.total_steps)
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(self.optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.student.parameters(), 1.0)
+                
+                if self.args.local_rank == 0:
+                    self.writer.add_scalar('train/grad_norm', grad_norm.item(), self.total_steps)
 
                 bad_grad = False
                 for name, param in self.student.named_parameters():
@@ -213,6 +232,9 @@ class DistillationTrainer:
                     if bad_grad:
                         print(name, param.grad.mean().item())
                     # print(name, torch.max(torch.abs(param.grad)).item())
+
+                scaler.step(self.optimizer)
+                scaler.update()
 
                 # bad_grad = False
                 # for name, param in self.student.named_parameters():
@@ -231,10 +253,6 @@ class DistillationTrainer:
                 #     self.optimizer.zero_grad(set_to_none = True)
                 #     scaler.update()
                 #     continue
-
-                torch.nn.utils.clip_grad_norm_(self.student.parameters(), 1.0)
-                scaler.step(self.optimizer)
-                scaler.update()
 
                 self.total_steps += 1
 
@@ -257,7 +275,7 @@ class DistillationTrainer:
 
             if self.total_steps % 1 == 0 and self.epoch % 5 == 0:
                 if self.args.local_rank == 0:
-                    checkpoint_path = os.path.join(self.args.checkpoint_dir, 'epoch_%03d_step_%06d.pth' % (self.epoch, self.total_steps))
+                    checkpoint_path = os.path.join(self.args.checkpoint_dir, 'epoch_%03d_step_%06d_loss_%.6f_epe_%.6f.pth' % (self.epoch, self.total_steps, round(np.mean(list_loss), 3), round(np.mean(list_epe), 3)))
                     torch.save({
                         'model': self.model_without_ddp.state_dict(),
                         'total_steps': self.total_steps,
@@ -291,11 +309,10 @@ class DistillationTrainer:
                     test_results_dict = validate_U3_giam_chan(model=self.model_without_ddp, teacher_model=self.teacher, device=self.device, val_dataset=self.val_dataset, dstype='dot1_T32026')
                     if self.args.local_rank == 0:
                         val_results.update(test_results_dict)
-
                 
                 self.counter += 1
 
-                if self.counter >= 10:
+                if self.counter >= (self.period_update_lr // 5):
                     for group in self.optimizer.param_groups:
                         group['lr'] *= 0.8
                     self.counter = 0
@@ -306,6 +323,7 @@ class DistillationTrainer:
                     with open(val_file, 'a') as f:
                         f.write('epoch %3d, step: %06d lr: %.6f\n' % (self.epoch, self.total_steps, self.optimizer.param_groups[-1]['lr']))
                         for k, v in val_results.items():
+                            self.writer.add_scalar(f'val/{k}', v, self.total_steps)
                             f.write("| %s: %.3f " % (k, v))
                         f.write('\n\n')
 

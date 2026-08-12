@@ -8,3 +8,6 @@ experiment/
 *.png
 test*
 .codex
+*onnx
+*trt
+*txt

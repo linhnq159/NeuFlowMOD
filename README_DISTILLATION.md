@@ -71,3 +71,6 @@ Checkpoints are saved in `./checkpoints/distillation/`:
 
 ## Exp:
 python train_distillation.py --checkpoint_dir experiment/16062026_resume/ --stage custom --val_dataset U3_giam_chan --batch_size 32 --num_workers 4 --lr 1e-4 --val_freq 1000 --resume experiment/16062026/step_002000.pth --strict_resume --lr 0.0001
+
+
+CUDA_VISIBLE_DEVICES=1 python train_distillation.py --checkpoint_dir experiment/07072026_resume_1/ --stage custom --val_dataset U3_giam_chan --batch_size 16 --num_workers 4 --lr 1e-4 --val_freq 2 --strict_resume --lr 0.0001 --resume neuflow_mixed.pth

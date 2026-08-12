@@ -13,10 +13,70 @@ from NeuFlow.backbone_v7 import ConvBlock
 
 use_fp16 = False
 
-file_name_folder = "NeuFlowV2_things_fullHD"
+file_name_folder = "NeuFlowV2_320"
 
-image_width = 1920 ## 960  ## 768
-image_height = 1088  ## 544 ## 432 must divible 16
+image_width = 320 ## 960  ## 768
+image_height = 320  ## 544 ## 432 must divible 16
+
+class TRTLayerNorm(nn.Module):
+    def __init__(self, normalized_shape, eps=1e-5, elementwise_affine=True):
+        super().__init__()
+
+        if isinstance(normalized_shape, int):
+            normalized_shape = (normalized_shape,)
+
+
+        self.normalized_shape = tuple(normalized_shape)
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+
+
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(self.normalized_shape))
+            self.bias = nn.Parameter(torch.zeros(self.normalized_shape))
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+
+
+    def forward(self, x):
+        dims = tuple(range(x.dim() - len(self.normalized_shape), x.dim()))
+
+        mean = x.mean(dim=dims, keepdim=True)
+        diff = x - mean
+        var = (diff * diff).mean(dim=dims, keepdim=True)
+
+        # Thay Div(Sqrt()) bằng Mul(Rsqrt())
+        x = diff * torch.rsqrt(var + self.eps)
+
+        if self.elementwise_affine:
+            x = x * self.weight + self.bias
+        return x
+
+def replace_layernorm(module):
+    for name, child in module.named_children():
+
+        if isinstance(child, nn.LayerNorm):
+            new_layer = TRTLayerNorm(
+                normalized_shape=child.normalized_shape,
+                eps=child.eps,
+                elementwise_affine=child.elementwise_affine
+            )
+
+
+            if child.elementwise_affine:
+                with torch.no_grad():
+                    new_layer.weight.copy_(child.weight)
+                    new_layer.bias.copy_(child.bias)
+
+
+            setattr(module, name, new_layer)
+
+
+            print(f"Replace: {name}")
+
+        else:
+            replace_layernorm(child)
 
 def fuse_conv_and_bn(conv, bn):
         """Fuse Conv2d() and BatchNorm2d() layers https://tehnokv.com/posts/fusing-batchnorm-and-conv/."""
@@ -47,6 +107,7 @@ def fuse_conv_and_bn(conv, bn):
 
         return fusedconv
 
+
 def build_model(device = "cpu"):
     # print(f"building  model...")
     # cfg = get_cfg()
@@ -63,17 +124,19 @@ def build_model(device = "cpu"):
 
     model = NeuFlow().to(device)
 
-    checkpoint = torch.load('neuflow_things.pth', map_location=device)
+    checkpoint = torch.load('/data/linhnq11/OpticalFlow/NeuFlow/experiment/07072026_resume_1/epoch_020_step_025641.pth', map_location=device)
 
     model.load_state_dict(checkpoint['model'], strict=True)
 
-    for m in model.modules():
-        if type(m) is ConvBlock:
-            m.conv1 = fuse_conv_and_bn(m.conv1, m.norm1)  # update conv
-            m.conv2 = fuse_conv_and_bn(m.conv2, m.norm2)  # update conv
-            delattr(m, "norm1")  # remove batchnorm
-            delattr(m, "norm2")  # remove batchnorm
-            m.forward = m.forward_fuse  # update forward
+    # for m in model.modules():
+    #     if type(m) is ConvBlock:
+    #         m.conv1 = fuse_conv_and_bn(m.conv1, m.norm1)  # update conv
+    #         m.conv2 = fuse_conv_and_bn(m.conv2, m.norm2)  # update conv
+    #         delattr(m, "norm1")  # remove batchnorm
+    #         delattr(m, "norm2")  # remove batchnorm
+    #         m.forward = m.forward_fuse  # update forward
+
+    replace_layernorm(model)
 
     model.eval()
 

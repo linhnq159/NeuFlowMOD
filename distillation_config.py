@@ -6,7 +6,7 @@ DISTILLATION_CONFIG = {
     'neuflow_checkpoint': '/data/linhnq11/OpticalFlow/NeuFlow/neuflow_things.pth',
     'searaft_checkpoint': '/data/linhnq11/MOD/SEA-RAFT/SEA-RAFT-models/Tartan-C-T-TSKH-spring540x960-M.pth',
     'searaft_config': '/data/linhnq11/MOD/SEA-RAFT/config/eval/sintel-L.json',
-
+    'flowformerplusplus' : '/data/linhnq11/OpticalFlow/FlowFormerPlusPlus-main/checkpoints/things.pth',
 
     # Loss weights
     'alpha': 0.7,  # Weight for distillation loss (1-alpha for task loss)
@@ -14,7 +14,7 @@ DISTILLATION_CONFIG = {
     'epsilon': 0.01,  # Epsilon for Charbonnier loss
     
     # Optimizer
-    'learning_rate': 1e-4,
+    'learning_rate': 5e-5, # default 1e - 4
     'weight_decay': 1e-4,
     'grad_clip': 1.0,
     

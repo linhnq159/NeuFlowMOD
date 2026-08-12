@@ -11,11 +11,18 @@ import os
 repo_SEARAFT = Path("/data/linhnq11/MOD/SEA-RAFT")
 sys.path.append(str(repo_SEARAFT))
 
+# Add segmentation for postprocessing
+repo_FlowFormerPlusPlus = Path("/data/linhnq11/OpticalFlow/FlowFormerPlusPlus-main")
+sys.path.append(str(repo_FlowFormerPlusPlus))
+
 # Import your models and utils
 from NeuFlow.neuflow import NeuFlow
-from core.raft import RAFT
-from core.utils.utils import load_ckpt
+from external.SEARAFT.core.raft import RAFT
+from external.SEARAFT.core.utils.utils import load_ckpt
 # from data.dataset import OpticalFlowDataset
+
+from external.FlowFormerPlusPlus.configs.submissions import get_cfg
+from external.FlowFormerPlusPlus.core.FlowFormer import build_flowformer
 
 from distillation_trainer import DistillationTrainer
 from distillation_config import DISTILLATION_CONFIG
@@ -42,6 +49,7 @@ def get_args_parser():
     parser.add_argument('--num_workers', default=8, type=int)
     parser.add_argument('--val_freq', default=1000, type=int)
     parser.add_argument('--num_steps', default=1000000, type=int)
+    parser.add_argument('--period_update_lr', default=20, type=int)
 
     parser.add_argument('--max_flow', default=400, type=int)
 
@@ -102,13 +110,22 @@ def load_models(args, config):
     
 
     #Load SEA-RAFT (teacher)
-    teacher = RAFT(args_SEARAFT)
-    if config['searaft_checkpoint']:
-        # checkpoint = torch.load(config['searaft_checkpoint'], map_location=device)
-        # teacher.load_state_dict(checkpoint)
-        load_ckpt(teacher, config['searaft_checkpoint'])
+    if config['model_teacher'] == 'SEARAFT':
+        teacher = RAFT(args_SEARAFT)
+        if config['searaft_checkpoint']:
+            # checkpoint = torch.load(config['searaft_checkpoint'], map_location=device)
+            # teacher.load_state_dict(checkpoint)
+            load_ckpt(teacher, config['searaft_checkpoint'])
+            teacher = teacher.to(device)
+    elif config['model_teacher'] == 'FlowFormerPlusPlus':
+        cfg_FFPP = get_cfg()
+        cfg_FFPP.model = config["flowformerplusplus"]
+        teacher = torch.nn.DataParallel(build_flowformer(cfg_FFPP))
+        print("cfg_FFPP.model : ", cfg_FFPP.model)
+        # x = input()
+        teacher.load_state_dict(torch.load(cfg_FFPP.model))
         teacher = teacher.to(device)
-    
+
     return student, teacher
 
 
