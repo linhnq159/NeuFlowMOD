@@ -163,8 +163,9 @@ class AlignmentChecks(unittest.TestCase):
 
 
 class TinyModel(nn.Module):
-    def __init__(self):
+    def __init__(self, seg_input='flow'):
         super().__init__()
+        self.seg_input = seg_input
         self.backbone_op = nn.Conv2d(3, 3, 1)
         self.seg_head = nn.Conv2d(3, 1, 1)
 

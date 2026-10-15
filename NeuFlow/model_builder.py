@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from NeuFlow.neuflow import NeuFlow
+from NeuFlow import config
 from external.ILNet.model.LW_Opticalflow import LW_OpticalFLow
 import torchvision.transforms as transforms
 
@@ -20,8 +21,9 @@ import torchvision.transforms as transforms
 class ModelBuilder(nn.Module):
     """Fine-tune NeuFlow through mask segmentation loss; flow labels are not required."""
 
-    def __init__(self):
+    def __init__(self, seg_input=None):
         super(ModelBuilder, self).__init__()
+        self.seg_input = config.validate_seg_input(config.seg_input if seg_input is None else seg_input)
 
         # build backbone
         self.backbone_op = NeuFlow()
@@ -32,7 +34,7 @@ class ModelBuilder(nn.Module):
         #                          **cfg.ADJUST.KWARGS)
 
         # build segment Unet head
-        self.seg_head = LW_OpticalFLow()
+        self.seg_head = LW_OpticalFLow(in_channels=5 if self.seg_input == 'flow_rgb' else 2)
         self._flow_init_key = None
 
         self.flow_normalize_seg = transforms.Normalize(
@@ -122,11 +124,18 @@ class ModelBuilder(nn.Module):
         amp = img0.is_cuda and torch.is_autocast_enabled()
         init_key = (batch_size, height, width, img0.device, amp)
         if self._flow_init_key != init_key:
-            self.backbone_op.init_bhwd(batch_size, height, width, img0.device, amp)
+            # Cached grids may later be reused for training after inference.
+            # Allocate normal tensors even if the first call uses inference_mode.
+            with torch.inference_mode(False):
+                self.backbone_op.init_bhwd(batch_size, height, width, img0.device, amp)
             self._flow_init_key = init_key
         flow_list = self.backbone_op(img0, img1, iters_s16=iters_s16, iters_s8=iters_s8,
                                      detach_flow_between_iters=False)
         # The last refined flow is available in both train and eval mode.
         # Mask loss trains every refinement step through the accumulated flow.
-        output_seg = self.seg_head(self.flow_normalize_seg(flow_list[-1]))
+        head_input = self.flow_normalize_seg(flow_list[-1])
+        if self.seg_input == 'flow_rgb':
+            rgb = img0.to(dtype=head_input.dtype) / 255.0
+            head_input = torch.cat((head_input, rgb), dim=1)
+        output_seg = self.seg_head(head_input)
         return output_seg

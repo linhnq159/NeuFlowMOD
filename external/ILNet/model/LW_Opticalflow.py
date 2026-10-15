@@ -42,8 +42,14 @@ class InitialBlock(nn.Module):
                  in_channels,
                  out_channels,
                  bias=False,
-                 relu=True):
+                 relu=True,
+                 pool_channels=None):
         super().__init__()
+
+        self.pool_channels = in_channels if pool_channels is None else pool_channels
+        if not 0 < self.pool_channels <= in_channels or self.pool_channels >= out_channels:
+            raise ValueError('Require 0 < pool_channels <= in_channels and pool_channels < out_channels.')
+        self.pool_flow_only = self.pool_channels != in_channels
 
         if relu:
             activation = nn.ReLU
@@ -52,7 +58,7 @@ class InitialBlock(nn.Module):
 
         self.main_branch = nn.Conv2d(
             in_channels,
-            out_channels - in_channels,
+            out_channels - self.pool_channels,
             kernel_size=3,
             stride=2,
             padding=1,
@@ -69,10 +75,10 @@ class InitialBlock(nn.Module):
         self.out_activation = activation()
         self.se = SEBlock(out_channels)
 
-    def forward(self, x): # x input : 1, 2, H, W
+    def forward(self, x): # Flow, optionally followed by current-frame RGB.
         main = self.main_branch(x) # 1 6 H/2 W/2
 
-        ext = self.ext_branch(x) #1 2 H/2 W/2
+        ext = self.ext_branch(x[:, :self.pool_channels] if self.pool_flow_only else x)
 
         # Concatenate branches
         out = torch.cat((main, ext), 1) # 1 8 H/2 W/2
@@ -406,11 +412,13 @@ class BoundaryAwareDecoder(nn.Module):
 
 # Lightweight Infrared small segmentation
 class LW_MOD(nn.Module):
-    def __init__(self, n_classes=1, encoder_relu=False, decoder_relu=True, channel=(8, 32, 64), dilations=(2,4,8,16), kernel_size=(3,5,7,9), padding=(1,2,3,4)):
+    def __init__(self, n_classes=1, encoder_relu=False, decoder_relu=True, channel=(8, 32, 64), dilations=(2,4,8,16), kernel_size=(3,5,7,9), padding=(1,2,3,4), in_channels=2):
         super().__init__()
 
         # Stage 1 - Encoder
-        self.initial_block = InitialBlock(2, channel[0], relu=encoder_relu)
+        if in_channels not in (2, 5):
+            raise ValueError('The motion head expects 2 flow or 5 flow+RGB channels.')
+        self.initial_block = InitialBlock(in_channels, channel[0], relu=encoder_relu, pool_channels=2)
 
         # Stage 2 - Encoder
         self.downsample1_0 = DownsamplingBottleneck(
@@ -652,9 +660,9 @@ class LW_MOD(nn.Module):
 
 
 
-def LW_OpticalFLow():
+def LW_OpticalFLow(in_channels=2):
     print("Using LW_V1")
-    return LW_MOD(channel=(8, 32, 64), dilations=(2,4,8,16), kernel_size=(7,7,7,7), padding=(3,3,3,3))
+    return LW_MOD(channel=(8, 32, 64), dilations=(2,4,8,16), kernel_size=(7,7,7,7), padding=(3,3,3,3), in_channels=in_channels)
 
 if __name__ == '__main__':
     from thop import profile, clever_format

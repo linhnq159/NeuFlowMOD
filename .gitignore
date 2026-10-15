@@ -11,3 +11,4 @@ test*
 *onnx
 *trt
 *txt
+!tool/requirements-export.txt

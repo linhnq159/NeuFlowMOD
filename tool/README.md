@@ -1,5 +1,50 @@
 # Training from image and mask folders
 
+## Launch scripts
+
+Activate your PyTorch environment first, or set `PYTHON_BIN=/path/to/python`.
+The launchers can run from any working directory; paths supplied by you remain
+relative to that working directory. All Python CLI options are supported.
+
+```bash
+# Train either head mode.
+bash scripts/train.sh --data_path /data/train --seg_input flow
+bash scripts/train.sh --data_path /data/train --seg_input flow_rgb
+
+# Initialize RGB from a flow checkpoint, with a fresh optimizer.
+bash scripts/train.sh --data_path /data/train --seg_input flow_rgb \
+  --transfer /results/flow/checkpoint/last.pth
+
+# Resume: the head mode is restored from the checkpoint.
+bash scripts/train.sh --data_path /data/train \
+  --resume /results/rgb/checkpoint/last.pth
+
+# Past image is already warped by the external system.
+bash scripts/infer.sh --checkpoint /results/rgb/checkpoint/last.pth \
+  --current /data/current.png --past /data/past_warped.png \
+  --output /results/mask.png --iters_s8 10
+```
+
+Training uses the Python trainer's existing defaults, including training-time
+homography stabilization. Outputs default to `<repository>/work_seg/checkpoint`;
+change this with `WORK_DIR` or `--work_dir`. If `--seg_input`/`SEG_INPUT` is unset,
+new training runs use `NeuFlow/config.py`, and resume uses the checkpoint.
+Inference disables internal warp by default and restores the mode, resolution
+and iteration settings from the checkpoint unless explicitly overridden.
+
+The scripts also support environment configuration:
+
+```bash
+DATA_PATH=/data/train SEG_INPUT=flow_rgb bash scripts/train.sh
+CHECKPOINT=/results/rgb/checkpoint/last.pth \
+  CURRENT_FRAME=/data/current.png PAST_FRAME=/data/past_warped.png \
+  OUTPUT_MASK=/results/mask.png bash scripts/infer.sh
+```
+
+CLI values override environment values for the same option. Use `--help` for
+launcher configuration, `--python-help` for the complete Python options, or
+`--dry-run` to print the exact command without starting training/inference.
+
 NeuFlow is the optical-flow backbone of the segmentation model. Training only
 needs two input frames and the ground-truth mask of the current frame; **no
 optical-flow ground truth or separate optical-flow loss is required**.
@@ -203,4 +248,151 @@ Run the dataset, freeze/LR, metric, and real-model resume checks with:
 ```bash
 python checks/check_frame_training.py
 python checks/check_stabilization.py
+```
+# Select the segmentation head input
+
+Set `seg_input = "flow"` or `seg_input = "flow_rgb"` in `NeuFlow/config.py`.
+An explicit `--seg_input` overrides that default for a new training run:
+
+```bash
+python tool/train.py --data_path /data/train --seg_input flow
+python tool/train.py --data_path /data/train --seg_input flow_rgb
+```
+
+`flow` supplies normalized `[u, v]` to the existing head. `flow_rgb` supplies
+`[u, v, R, G, B]`, using the **current frame**, RGB order, divided by 255 and
+converted to the flow dtype. The stem convolution changes from 2→6 to 5→6
+channels; max-pooling still sees only the first two flow channels. The combined
+stem output remains eight channels. There is no additional image encoder.
+
+The effective selection is saved in `config.json` and checkpoint `args`.
+Resume and inference restore it before constructing the model; a conflicting
+CLI selection is rejected. A legacy checkpoint with no `seg_input` means
+`flow`, even if the default in `NeuFlow/config.py` has since changed.
+`ModelBuilder(seg_input=None)` uses the Python config default; explicit
+`ModelBuilder(seg_input="flow_rgb")` selects RGB directly.
+
+Use **transfer**, with a fresh optimizer, to extend a trained flow model:
+
+```bash
+python tool/train.py --data_path /data/train --seg_input flow_rgb \
+  --transfer /results/flow/checkpoint/last.pth
+```
+
+The six original flow filters are copied and the three new input-channel
+weights are zeroed. Initial predictions match the old model, while RGB weights
+receive gradients during training. Other weights retain their values. Same-mode
+transfer is supported; conversion from a trained RGB head back to flow is
+rejected rather than silently discarding learned RGB inputs. Changing modes
+with `--resume` is rejected. The legacy `--dataset opticalflow` accepts only
+`flow`, since it has no current images.
+
+When an external system already warps the past image into current-frame
+coordinates, explicitly disable the built-in warp:
+
+```bash
+python tool/infer.py --checkpoint /results/rgb/checkpoint/last.pth \
+  --current /data/current.png --past /data/past_already_warped.png \
+  --output /results/mask.png --stabilization none
+```
+
+The head mode is restored from this checkpoint automatically. Both model inputs
+remain RGB images in `[0,255]`, including for the RGB head; do not divide by
+255 before calling `ModelBuilder`.
+
+## Export the full segmentation model
+
+Install `tool/requirements-export.txt` in the PyTorch environment. TensorRT is
+not needed to prepare and validate ONNX on a CPU workstation.
+
+```bash
+python -m pip install -r tool/requirements-export.txt
+python tool/export_seg.py --checkpoint /results/rgb/checkpoint/last.pth \
+  --output /results/rgb.onnx --img_size 960 544 --iters_s8 8
+```
+
+This exports **NeuFlow plus segmentation**, with fixed batch one, FP32 NCHW
+`current`/`past` inputs and FP32 `logits` output. Normalization and RGB
+concatenation are inside the graph; camera warp, image resize and output
+thresholding remain outside. The old root `pt2onnx.py` exports only optical
+flow and should not be used for these segmentation checkpoints.
+
+Export works on a copy, replacing each zero-hidden-channel SE block with its
+exact `x * 0.5` equivalent. It checks the ONNX model and compares logits against
+PyTorch on two deterministic frame pairs (`atol=rtol=1e-3`). A `.json` sidecar
+records checks/configuration and the ONNX SHA256; `.validation.npz` stores the
+inputs and reference logits for TensorRT verification. Export fails on a
+numerical mismatch. These checks validate execution, not detection accuracy.
+
+## Compare TensorRT FP16 latency
+
+Prepare matching baselines and RGB experiments on the workstation:
+
+```bash
+python tool/benchmark_seg.py --phase prepare --output_dir /results/head_benchmark \
+  --checkpoint /results/flow/checkpoint/last.pth --img_size 960 544 --iters_s8 8 10
+```
+
+The starting checkpoint must be a full **flow-only** model. If omitted, the
+tool uses `neuflow_sintel.pth` and a seeded, untrained head. All common weights
+are identical between models. For this timing experiment only, new RGB weights
+use deterministic nonzero values, preventing a trivially unused RGB path.
+The benchmark weights are not a trained detection model.
+
+Copy the complete artifact directory and this repository to the measuring
+machine, then run in its PyTorch/CUDA/TensorRT >= 8.6 environment:
+
+```bash
+python tool/benchmark_seg.py --phase run --output_dir /results/head_benchmark
+```
+
+On Jetson use the CUDA/TensorRT packages supplied by JetPack. Engines are built
+on the measuring GPU, with FP16 enabled, TF32 disabled, FP32 I/O, and equal
+workspace limits. Some layers may retain FP32 for supported fallback behavior.
+Engines built on RTX are not copied to Orin.
+
+Before timing, TensorRT logits must pass the saved PyTorch references with
+`atol=rtol=0.01` and binary-mask agreement >= 99.5%. Tolerances are configurable
+and recorded. A failed validation prevents a latency conclusion. Any additional
+export/precision optimization must be applied to both models and revalidated.
+
+Defaults: batch 1, 960×544, S16=1, S8=8 and 10, five rounds with at least 1,000
+samples per mode/stage, and at least three seconds of warm-up before each stage.
+Model order alternates between rounds. Device-resident measurements use CUDA
+events around the entire graph. A second stage measures host-observed latency
+including H2D/D2H using preallocated pinned buffers. Both include graph RGB
+normalization/concatenation and exclude file I/O, engine builds and external
+warp. There is no CUDA graph or concurrent inference.
+
+`timings.csv` contains individual samples. `report.json` contains median, p95,
+absolute/relative increases, round consistency, numerical validation, hardware
+and temperature snapshots. A pass requires **both median and p95 <= +5%** for
+GPU inference and the transfer-inclusive path, in aggregate and in every round.
+A passing aggregate with failing individual rounds is `inconclusive`.
+
+Memory fields distinguish TRT's context workspace, PyTorch's peak allocation
+(which excludes TRT), and sampled global device use. The latter is an observed
+high-water mark, not an exact trace of transient allocation peaks. Run on an
+otherwise idle device; global memory and temperature can include other work.
+
+Without a GPU, use the arithmetic-only report:
+
+```bash
+python tool/benchmark_seg.py --phase estimate --output_dir /results/head_estimate
+```
+
+At 960×544 the modified convolution adds 162 parameters and 21,150,720 MACs.
+Unfused FP16 RGB/concatenation intermediates are approximately 2.99/4.98 MiB;
+TensorRT may fuse them. These figures do **not** predict milliseconds or prove
+the 5% limit. A failed GPU/export preflight writes `status: not_measured`, with
+no latency pass. RTX 2060 SUPER measurements are reference measurements only,
+not estimates of Jetson AGX Orin performance.
+
+Run the behavior checks, including actual ONNX validation when dependencies are
+installed:
+
+```bash
+python checks/check_frame_training.py
+python checks/check_stabilization.py
+python checks/check_seg_input.py
 ```

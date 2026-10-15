@@ -20,7 +20,9 @@ from tqdm import tqdm
 
 from data_utils.frame_mask_dataset import FrameMaskDataset
 from data_utils.frame_pair import init_frame_worker
-from tool.checkpoints import load_checkpoint, load_weights, resolve_stabilization
+from tool.checkpoints import (load_checkpoint, load_weights, load_model_weights,
+                              resolve_stabilization, resolve_seg_input, transfer_model_weights)
+from NeuFlow.config import SEG_INPUT_MODES
 from NeuFlow.model_builder import ModelBuilder
 from external.ILNet.utils.Adan import Adan
 from external.ILNet.optimizer.adamW_msam import AdamW_MSAM
@@ -43,6 +45,8 @@ def parse_args(argv=None):
     parser.add_argument('--lr_sch', choices=['ilnet', 'cos'], default='ilnet')
     parser.add_argument('--dataset', choices=['frames', 'opticalflow'], default='frames',
                         help='frames: image pairs + masks; opticalflow: legacy .npy flow (head only)')
+    parser.add_argument('--seg_input', choices=SEG_INPUT_MODES, default=None,
+                        help='Head input; new runs use NeuFlow/config.py, resume uses checkpoint')
     parser.add_argument('--data_path', help='Dataset root with images/ and masks/, or the legacy flow root')
     parser.add_argument('--image_dir', '--train_image_dir', dest='image_dir', help='Training image folder')
     parser.add_argument('--mask_dir', '--train_mask_dir', dest='mask_dir', help='Training ground-truth mask folder')
@@ -79,6 +83,8 @@ def parse_args(argv=None):
     parser.add_argument('--backbone_layer_lr', type=float, default=0.1,
                         help='Backbone LR / head LR throughout training')
     args = parser.parse_args(argv)
+    if args.resume and args.transfer:
+        parser.error('Choose either --resume or --transfer, not both.')
     if args.batch_size < 2:
         parser.error('--batch_size must be >= 2 because the head has BatchNorm after global pooling.')
     if args.epochs < 1 or args.start_epoch < 1 or args.start_epoch > args.epochs:
@@ -111,7 +117,10 @@ def parse_args(argv=None):
 
 
 def build_datasets(args):
+    args.seg_input = resolve_seg_input(args.seg_input, load_checkpoint(args.resume) if args.resume else None)
     if args.dataset == 'opticalflow':
+        if args.seg_input != 'flow':
+            raise ValueError('seg_input=flow_rgb requires --dataset frames with current RGB images.')
         from external.ILNet.utils.data import CustomDatasetOpticalFlow
         print('Precomputed optical flow: training the segmentation head only.')
         return (CustomDatasetOpticalFlow(args.data_path, mode='train', args=args),
@@ -139,6 +148,7 @@ class Trainer:
         self.args = args
         self.device = torch.device(args.device)
         checkpoint = load_checkpoint(args.resume) if args.resume else None
+        args.seg_input = resolve_seg_input(args.seg_input, checkpoint)
         args.stabilization = resolve_stabilization(args.stabilization, checkpoint)
         self.train_set, self.val_set = build_datasets(args)
         if len(self.train_set) < 2:
@@ -153,17 +163,22 @@ class Trainer:
                                 if self.val_set is not None else None)
         print(f'Train: {len(self.train_set)} pairs; validation: {len(self.val_set) if self.val_set is not None else 0}; '
               f'batch size: {batch_size}; frame_skip: {args.frame_skip}; '
-              f'iterations S16/S8: {args.iters_s16}/{args.iters_s8}; stabilization: {args.stabilization}')
-        self.model = ModelBuilder().to(self.device)
+              f'iterations S16/S8: {args.iters_s16}/{args.iters_s8}; stabilization: {args.stabilization}; '
+              f'seg_input: {args.seg_input}')
+        self.model = ModelBuilder(seg_input=args.seg_input).to(self.device)
         if not args.resume:
             if args.transfer:
-                load_weights(self.model, args.transfer)
+                transfer_model_weights(self.model, load_checkpoint(args.transfer))
             elif args.backbone_op_pretrained:
                 load_weights(self.model.backbone_op, args.backbone_op_pretrained, strict=False)
         self.teacher = None
         if args.teacher:
-            self.teacher = ModelBuilder().to(self.device)
-            load_weights(self.teacher, args.teacher)
+            teacher_checkpoint = load_checkpoint(args.teacher)
+            teacher_mode = resolve_seg_input(checkpoint=teacher_checkpoint)
+            if args.dataset == 'opticalflow' and teacher_mode != 'flow':
+                raise ValueError('A flow_rgb teacher requires the frames dataset.')
+            self.teacher = ModelBuilder(seg_input=teacher_mode).to(self.device)
+            load_model_weights(self.teacher, teacher_checkpoint)
             self.teacher.requires_grad_(False).eval()
         self.scaler = torch.amp.GradScaler('cuda', enabled=args.amp and self.device.type == 'cuda')
         self.optimizer, self.lr_scheduler = self.build_opt_lr(self.model)

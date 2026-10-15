@@ -1,0 +1,5 @@
+# Install alongside the project's PyTorch/torchvision environment.
+onnx>=1.16,<2
+onnxruntime>=1.18,<2
+# GPU benchmarking additionally needs TensorRT >= 8.6, supplied by JetPack on Jetson.
+# Do not replace JetPack's CUDA/TensorRT packages with desktop wheels.

@@ -15,7 +15,9 @@ import torch.nn.functional as F
 
 from data_utils.frame_pair import load_frame_pair
 from NeuFlow.model_builder import ModelBuilder
-from tool.checkpoints import checkpoint_args, load_checkpoint, load_model_weights, resolve_stabilization
+from tool.checkpoints import (checkpoint_args, load_checkpoint, load_model_weights,
+                              resolve_stabilization, resolve_seg_input)
+from NeuFlow.config import SEG_INPUT_MODES
 
 
 def parse_args(argv=None):
@@ -27,6 +29,8 @@ def parse_args(argv=None):
     parser.add_argument('--img_size', nargs=2, type=int, metavar=('WIDTH', 'HEIGHT'))
     parser.add_argument('--iters_s16', type=int)
     parser.add_argument('--iters_s8', type=int)
+    parser.add_argument('--seg_input', choices=SEG_INPUT_MODES,
+                        help='Optional checkpoint architecture check; defaults to checkpoint (legacy: flow)')
     parser.add_argument('--stabilization', choices=['none', 'homography'], default=None,
                         help='Default: checkpoint setting; older checkpoints use none')
     parser.add_argument('--device', default='cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -41,6 +45,7 @@ def parse_args(argv=None):
 
 
 def resolve_config(args, checkpoint):
+    args.seg_input = resolve_seg_input(args.seg_input, checkpoint)
     saved = checkpoint_args(checkpoint)
     for name, default in [('img_size', [960, 544]), ('iters_s16', 1), ('iters_s8', 8)]:
         if getattr(args, name) is None:
@@ -68,9 +73,10 @@ def run_inference(args):
     current, past, alignment, original_size = load_frame_pair(
         current_path, past_path, args.img_size, args.stabilization)
     print(alignment.summary())
-    print(f'Input size: {args.img_size}; iterations S16/S8: {args.iters_s16}/{args.iters_s8}')
+    print(f'Input size: {args.img_size}; iterations S16/S8: {args.iters_s16}/{args.iters_s8}; '
+          f'seg_input: {args.seg_input}')
     device = torch.device(args.device)
-    model = ModelBuilder().to(device)
+    model = ModelBuilder(seg_input=args.seg_input).to(device)
     load_model_weights(model, checkpoint)
     model.eval()
     current, past = current.unsqueeze(0).to(device), past.unsqueeze(0).to(device)
