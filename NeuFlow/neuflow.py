@@ -152,12 +152,17 @@ class NeuFlow(torch.nn.Module,
     #     return flow_list
 
 
-    def forward(self, img0, img1, iters_s16=1, iters_s8=8):
+    def forward(self, img0, img1, iters_s16=1, iters_s8=8, detach_flow_between_iters=True):
+        """Refine flow with shared weights; MOD disables detaching between iterations."""
+
+        for name, iterations in [('iters_s16', iters_s16), ('iters_s8', iters_s8)]:
+            if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations < 1:
+                raise ValueError(f'{name} must be a positive integer.')
 
         flow_list = []
 
-        img0 /= 255.
-        img1 /= 255.
+        img0 = img0 / 255.
+        img1 = img1 / 255.
 
         features_s16, features_s8 = self.backbone(torch.cat([img0, img1], dim=0))
 
@@ -178,7 +183,7 @@ class NeuFlow(torch.nn.Module,
 
         for i in range(iters_s16):
 
-            if self.training and i > 0:
+            if self.training and i > 0 and detach_flow_between_iters:
                 flow0 = flow0.detach()
                 # iter_context_s16 = iter_context_s16.detach()
 
@@ -212,7 +217,7 @@ class NeuFlow(torch.nn.Module,
             # print("iters_s8 : ", iters_s8)
             # x = input()
 
-            if self.training and i > 0:
+            if self.training and i > 0 and detach_flow_between_iters:
                 flow0 = flow0.detach()
                 # iter_context_s8 = iter_context_s8.detach()
 

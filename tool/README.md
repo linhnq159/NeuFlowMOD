@@ -1,0 +1,206 @@
+# Training from image and mask folders
+
+NeuFlow is the optical-flow backbone of the segmentation model. Training only
+needs two input frames and the ground-truth mask of the current frame; **no
+optical-flow ground truth or separate optical-flow loss is required**.
+
+```text
+current frame ---------------------------------------> NeuFlow S16/S8
+past frame -> homography -> warp to current frame ---->       |
+                                                       final flow
+                                                            |
+                                                     segmentation head
+                                                            |
+                                               mask loss vs current-frame mask
+```
+
+The training objective is the segmentation loss, including the segmentation
+head's auxiliary mask outputs. Once the backbone is unfrozen, backpropagation
+through the head and flow normalization updates NeuFlow as well. The MOD model
+keeps the accumulated flow differentiable between iterations, so mask loss
+reaches every S16/S8 flow update. All refinement steps and training predictions
+are retained; S16/S8 use one/eight iterations by default. This frame/mask training
+setup uses `--dataset frames` (the default) and no teacher/distillation model.
+
+```bash
+python tool/train.py \
+  --image_dir /data/train/images \
+  --mask_dir /data/train/masks \
+  --val_image_dir /data/val/images \
+  --val_mask_dir /data/val/masks \
+  --frame_skip 3 \
+  --stabilization homography \
+  --iters_s16 1 \
+  --iters_s8 8 \
+  --img_size 960 544 \
+  --epoch_training_backbone 300 \
+  --backbone_layer_lr 0.1
+```
+
+Each sample is **(current frame `t`, past frame `t - frame_skip`, mask at `t`)**.
+`frame_skip=1` uses adjacent frames. The gap is measured in positions in the
+naturally sorted file list (`frame_2.jpg` precedes `frame_10.jpg`), not seconds or
+the difference between numeric filenames. The first `frame_skip` frames in each
+sequence have no earlier partner and are omitted as targets.
+
+Images and ground-truth masks must have the same relative path and filename stem;
+their extensions may differ. Use one folder per video. Pairs never cross folders.
+Both a flat folder and this nested layout are supported:
+
+```text
+images/
+  video_1/frame_001.jpg
+  video_1/frame_002.jpg
+  video_2/frame_001.jpg
+masks/
+  video_1/frame_001.png
+  video_1/frame_002.png
+  video_2/frame_001.png
+```
+
+Masks must be **PNG or BMP**. JPEG, WebP, TIFF and other image formats in the mask
+folder are rejected; the reader also checks the decoded format to catch JPEG
+files renamed to `.png` or `.bmp`. Export masks from the original annotations:
+converting a compressed JPEG mask to PNG does not recover its original labels.
+Input images can still be JPEG or any other previously supported image format.
+
+Masks are binary: zero is background, positive values are foreground, including
+both 0/1 and 0/255 encodings. PNG palette masks use their class IDs. Images and
+their masks must originally have matching dimensions. Both frames resize to
+`--img_size WIDTH HEIGHT`; masks use nearest-neighbor resizing. Images convert
+to RGB in the range 0–255, as expected by NeuFlow.
+
+## Stabilizing the past frame
+
+New training runs default to `--stabilization homography`. Training, validation
+and inference use the same preprocessing in `data_utils/frame_pair.py`. Only the
+past frame is warped into the current frame's coordinates; the current frame
+and ground-truth mask receive their usual resize and no geometric warp. The
+stabilizer uses only the two images, never ground-truth masks. It runs on CPU
+before the model; the segmentation loss still trains the unfrozen NeuFlow.
+
+The implementation uses OpenCV SIFT (up to 2,000 features), mutual descriptor
+matches with a 0.75 Lowe ratio, and RANSAC homography from past to current.
+Estimation uses a maximum long side of 960 pixels; the transform is converted
+back to model-input coordinates before bilinear warping. OpenCV with SIFT is
+required (for example `opencv-python-headless >= 4.4`).
+
+RANSAC uses a 3-pixel reprojection threshold at the estimation resolution,
+2,000 maximum iterations and 0.995 confidence. Acceptance requires at least 12
+inliers, an inlier ratio of 50%, an inlier hull covering at least 5% of each
+image, and at least 50% valid overlap. Singular/reflected transforms and
+transforms crossing the projective horizon are rejected. Missing warped pixels
+are filled from the current frame; those regions have no inter-frame motion
+signal. Failed alignment falls back to the unwarped past frame. Training warns
+once per failure reason in each dataset worker; inference prints its status.
+
+`--stabilization none` reproduces the previous RGB/resize preprocessing. The
+selected mode is saved in checkpoint arguments. Resume and inference inherit
+the saved mode unless explicitly overridden; old checkpoints without this
+field default to `none`. To enable alignment for an old checkpoint, explicitly
+pass `--stabilization homography`. Direct `FrameMaskDataset` callers also default
+to `none` for compatibility; the trainer passes its resolved mode explicitly.
+
+A single homography describes a planar scene or predominantly rotational camera
+motion. Parallax from different depths, sparse texture, or moving objects
+dominating the matches can reduce alignment quality. The checks reject obvious
+failures but cannot guarantee that every accepted transform follows the
+background. Validate segmentation quality on your camera data.
+
+Without separate validation folders, `--val_split 0.2` reserves the last 20% of
+frames in each sequence for validation **before** forming pairs. Train and
+validation therefore share no frames. Each selected sequence portion must have
+more than `frame_skip` frames to produce samples. `--val_split 0` disables
+validation. Separate videos for validation are preferable when available.
+`--data_path /data/train` is shorthand for `/data/train/images` and `/data/train/masks`.
+
+Epochs **1–299 freeze all backbone weights and BatchNorm statistics**. Epoch
+**300** starts training the backbone at `0.1 ×` the head's current learning rate.
+The optimizer and scheduler continue without restarting. `--epoch_training_backbone 1`
+starts backbone training immediately. The default pretrained backbone is the
+repository's `neuflow_sintel.pth`; use `--backbone_op_pretrained PATH` to change it,
+or `--backbone_op_pretrained ''` for random initialization.
+
+The current trainer requires a training batch size of at least two and drops
+incomplete training batches; validation keeps all samples. For a CPU smoke run,
+use e.g. `--device cpu --img_size 32 32
+--batch_size 2 --num_workers 0 --epochs 2 --warm_up_epochs 0 --no-amp --no-tensorboard`.
+
+Checkpoints are written under `--work_dir`, with `checkpoint/last.pth` saved each
+epoch, even when validation is disabled. Resume with the same data, scheduler
+and iteration settings and `--resume /path/to/checkpoint/last.pth`. Checkpoints
+save `iters_s16`/`iters_s8` in their arguments. Older checkpoints without these
+fields still load with the CLI defaults of 1/8. Checkpoints from the earlier
+single-parameter-group optimizer should instead be loaded with `--transfer` to
+initialize weights and start a new optimizer.
+
+## Two-image segmentation inference
+
+```bash
+python tool/infer.py \
+  --checkpoint /path/to/checkpoint/last.pth \
+  --current /data/frame_010.png \
+  --past /data/frame_007.png \
+  --output /results/frame_010_mask.png \
+  --stabilization homography \
+  --iters_s8 10
+```
+
+Supply a full **ModelBuilder segmentation checkpoint**. The two original images
+must have matching dimensions. The command stabilizes the past image, runs the
+model, resizes logits back to the current image's original size, applies sigmoid
+and `--threshold` (default 0.5), and writes a single-channel PNG containing 0/255.
+The output remains in current-frame coordinates. Missing output directories are
+created; either input image and the checkpoint are protected from overwrite.
+
+`--img_size WIDTH HEIGHT`, `--iters_s16` and `--iters_s8` override checkpoint
+settings. If neither CLI nor checkpoint supplies them, defaults are 960×544,
+S16=1 and S8=8. Stabilization follows the checkpoint rules above. `--device`
+defaults to CUDA when available, otherwise CPU; `--no-amp` disables CUDA AMP.
+The script prints alignment success/fallback and the chosen model input size.
+
+## Inference with a different number of iterations
+
+`--iters_s16` and `--iters_s8` must be positive integers. They control training
+and validation, and the teacher when one is configured. Inference chooses them
+independently through `ModelBuilder.forward`; all iterations share weights, so
+a checkpoint trained with eight S8 iterations can run ten without changing its
+state dictionary:
+
+```python
+import torch
+from NeuFlow.model_builder import ModelBuilder
+from tool.checkpoints import load_weights
+from data_utils.frame_pair import load_frame_pair
+
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+model = ModelBuilder().to(device)
+load_weights(model, '/path/to/checkpoint/last.pth')
+model.eval()
+current, past, alignment, original_size = load_frame_pair(
+    '/data/current.png', '/data/past.png', img_size=(960, 544),
+    stabilization='homography',  # Use the mode selected during training.
+)
+current, past = current.unsqueeze(0).to(device), past.unsqueeze(0).to(device)
+with torch.inference_mode():
+    logits = model(current, past, iters_s16=1, iters_s8=10)
+    mask = torch.sigmoid(logits) > 0.5
+```
+
+Compare validation quality and runtime at 8 and 10 before choosing an inference
+setting; additional refinement does not guarantee better masks. Full gradient
+propagation can increase training memory after unfreezing the backbone. Direct
+calls to `NeuFlow.forward` retain the legacy `detach_flow_between_iters=True`
+default; `ModelBuilder` explicitly disables it for MOD. This API example returns
+a mask at model-input resolution; `tool/infer.py` restores the original size.
+
+The old precomputed-flow dataset remains available with `--dataset opticalflow
+--data_path /path/to/flow_dataset`. It trains only the segmentation head because
+the original image pairs are absent. `frame_skip` applies to the `frames` dataset.
+
+Run the dataset, freeze/LR, metric, and real-model resume checks with:
+
+```bash
+python checks/check_frame_training.py
+python checks/check_stabilization.py
+```
