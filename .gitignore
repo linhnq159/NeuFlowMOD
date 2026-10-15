@@ -12,3 +12,9 @@ test*
 *trt
 *txt
 !tool/requirements-export.txt
+
+onnx_tensorrt/*
+*/*.onnx
+*/*.jpg
+*/*png
+*/*pt*
