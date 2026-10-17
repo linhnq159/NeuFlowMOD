@@ -159,14 +159,76 @@ class DatasetChecks(unittest.TestCase):
         self.assertEqual(past.shape, current.shape)
         torch.testing.assert_close(mask, expected, rtol=0, atol=0)
 
-    def test_missing_target_mask_and_bad_skip(self):
+    def test_sparse_masks_keep_unmasked_past_frames_and_original_skip(self):
         with self.assertRaisesRegex(ValueError, 'frame_skip'):
             self.dataset(frame_skip=0)
-        (self.masks / 'frame_1.bmp').unlink()  # A past-only frame needs no mask.
-        self.dataset()
-        (self.masks / 'frame_2.bmp').unlink()
-        with self.assertRaisesRegex(FileNotFoundError, 'frame_2'):
+        for mask in self.masks.glob('*.bmp'):
+            if mask.stem not in ('frame_3', 'frame_5'):
+                mask.unlink()
+        for skip, expected in ((1, [('frame_3', 'frame_2'), ('frame_5', 'frame_4')]),
+                               (2, [('frame_3', 'frame_1'), ('frame_5', 'frame_3')])):
+            dataset = self.dataset(frame_skip=skip)
+            self.assertEqual([(current.stem, past.stem) for current, past, _ in dataset.samples], expected)
+            for index in range(len(dataset)):
+                self.assertEqual(dataset[index][2].shape, (1, 32, 32))
+
+    def test_sparse_masks_preserve_sequence_and_split_boundaries(self):
+        make_sequence(self.root, sequence='other')
+        for mask in self.masks.rglob('*.bmp'):
+            if mask.stem not in ('frame_3', 'frame_11'):
+                mask.unlink()
+        train = self.dataset(frame_skip=1, split='train', val_split=0.25)
+        val = self.dataset(frame_skip=1, split='val', val_split=0.25)
+        self.assertEqual(len(train), 2)
+        self.assertEqual(len(val), 2)
+        self.assertEqual({sample[0].stem for sample in train.samples}, {'frame_3'})
+        self.assertEqual({sample[1].stem for sample in val.samples}, {'frame_10'})
+        train_frames = {path for sample in train.samples for path in sample[:2]}
+        val_frames = {path for sample in val.samples for path in sample[:2]}
+        self.assertFalse(train_frames & val_frames)
+        for current, past, _ in train.samples + val.samples:
+            self.assertEqual(current.parent, past.parent)
+
+    def test_no_masked_pairs_reports_error(self):
+        for mask in self.masks.glob('*.bmp'):
+            if mask.stem != 'frame_1':
+                mask.unlink()
+        with self.assertRaisesRegex(ValueError, 'matching mask'):
             self.dataset()
+
+    def test_sparse_masks_in_separate_validation_and_empty_validation(self):
+        val_images, val_masks = make_sequence(self.root / 'validation', count=5)
+        for mask in val_masks.glob('*.bmp'):
+            if mask.stem not in ('frame_3', 'frame_5'):
+                mask.unlink()
+        args = parse_args(['--data_path', str(self.root), '--val_image_dir', str(val_images),
+                           '--val_mask_dir', str(val_masks), '--stabilization', 'none'])
+        train, val = build_datasets(args)
+        self.assertEqual(len(train), 11)
+        self.assertEqual([(a.stem, b.stem) for a, b, _ in val.samples],
+                         [('frame_3', 'frame_2'), ('frame_5', 'frame_4')])
+        for mask in val_masks.glob('*.bmp'):
+            mask.unlink()
+        with self.assertRaisesRegex(ValueError, 'matching mask'):
+            build_datasets(args)
+
+    def test_empty_temporal_validation_is_not_disabled(self):
+        for index in (11, 12):
+            (self.masks / f'frame_{index}.bmp').unlink()
+        args = parse_args(['--data_path', str(self.root), '--val_split', '0.25'])
+        with self.assertRaisesRegex(ValueError, "split='val'.*matching mask"):
+            build_datasets(args)
+
+    def test_cli_requires_image_mask_paths_and_rejects_dataset_option(self):
+        args = parse_args(['--image_dir', str(self.images), '--mask_dir', str(self.masks)])
+        self.assertEqual(args.image_dir, str(self.images))
+        self.assertEqual(args.mask_dir, str(self.masks))
+        self.assertFalse(hasattr(args, 'dataset'))
+        for command in ([], ['--image_dir', str(self.images)], ['--mask_dir', str(self.masks)],
+                        ['--data_path', str(self.root), '--dataset', 'frames'],
+                        ['--data_path', str(self.root), '--dataset', 'opticalflow']):
+            with self.subTest(command=command), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                parse_args(command)
 
     def test_duplicate_stem_and_dimension_errors(self):
         Image.new('L', (32, 32)).save(self.masks / 'frame_2.png')
@@ -260,7 +322,7 @@ class OptimizerChecks(unittest.TestCase):
             for schedule in ('ilnet', 'cos'):
                 with self.subTest(optimizer=optimizer_name, schedule=schedule):
                     trainer = Trainer.__new__(Trainer)
-                    trainer.args = SimpleNamespace(dataset='frames', optim=optimizer_name,
+                    trainer.args = SimpleNamespace(optim=optimizer_name,
                         lr_sch=schedule, learning_rate=1e-3, backbone_layer_lr=0.1,
                         epoch_training_backbone=3, warm_up_epochs=1, epochs=5,
                         loss='BCE', clip_grad=0.0, iters_s16=2, iters_s8=10)
@@ -312,7 +374,7 @@ class RealModelChecks(unittest.TestCase):
 
         torch.manual_seed(42)
         trainer = Trainer.__new__(Trainer)
-        trainer.args = SimpleNamespace(loss='BCE', dataset='frames',
+        trainer.args = SimpleNamespace(loss='BCE',
                                        epoch_training_backbone=300, backbone_layer_lr=0.1,
                                        iters_s16=iters_s16, iters_s8=iters_s8)
         trainer.model = ModelBuilder().train()

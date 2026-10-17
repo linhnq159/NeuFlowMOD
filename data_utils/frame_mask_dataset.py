@@ -28,6 +28,8 @@ class FrameMaskDataset(Dataset):
     ``frame_skip=1`` pairs adjacent files after natural sorting. Inputs are
     (current frame, past frame), and the mask belongs to the current frame.
     Temporal train/validation splits happen before constructing frame pairs.
+    Only current frames with masks become targets; unmasked frames remain
+    available as past frames and count toward ``frame_skip``.
     """
 
     def __init__(self, image_dir, mask_dir, img_size=(960, 544), frame_skip=1,
@@ -86,13 +88,14 @@ class FrameMaskDataset(Dataset):
                 source, reference = frames[index], frames[index - frame_skip]
                 key = source.relative_to(self.image_dir).with_suffix('')
                 if key not in masks:
-                    raise FileNotFoundError(f'Missing mask for {source}; expected {self.mask_dir / key}.*')
+                    continue
                 self.samples.append((source, reference, masks[key]))
         if not self.samples:
             raise ValueError(
                 f'No frame pairs for split={split!r} in {self.image_dir}. '
-                f'Each selected sequence needs more than {frame_skip} frames. '
-                'Reduce frame_skip/val_split or provide separate validation folders.')
+                f'Each selected sequence needs more than {frame_skip} frames and '
+                'at least one current frame with a matching mask after pairing. '
+                'Check mask paths, reduce frame_skip/val_split or provide separate validation folders.')
 
     def __len__(self):
         return len(self.samples)

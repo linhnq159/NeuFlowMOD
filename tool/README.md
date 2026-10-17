@@ -65,7 +65,7 @@ through the head and flow normalization updates NeuFlow as well. The MOD model
 keeps the accumulated flow differentiable between iterations, so mask loss
 reaches every S16/S8 flow update. All refinement steps and training predictions
 are retained; S16/S8 use one/eight iterations by default. This frame/mask training
-setup uses `--dataset frames` (the default) and no teacher/distillation model.
+setup needs only image and mask folders, with no teacher/distillation model.
 
 ```bash
 python tool/train.py \
@@ -87,6 +87,15 @@ Each sample is **(current frame `t`, past frame `t - frame_skip`, mask at `t`)**
 naturally sorted file list (`frame_2.jpg` precedes `frame_10.jpg`), not seconds or
 the difference between numeric filenames. The first `frame_skip` frames in each
 sequence have no earlier partner and are omitted as targets.
+
+Masks may cover only some frames. Pairs are constructed from the complete image
+list, then kept only when the current frame has a matching mask. The past frame
+does not need a mask; unmasked images still count toward `frame_skip`. For images
+1–5 with masks only for 3 and 5, `frame_skip=1` produces `(3, 2, mask 3)` and
+`(5, 4, mask 5)`. Train/validation splitting happens before pairing and mask
+filtering, so pairs never cross split boundaries. This also applies to separate
+validation folders. A selected train or validation set with no valid masked
+pairs raises an error; validation is not silently disabled.
 
 Images and ground-truth masks must have the same relative path and filename stem;
 their extensions may differ. Use one folder per video. Pairs never cross folders.
@@ -239,9 +248,10 @@ calls to `NeuFlow.forward` retain the legacy `detach_flow_between_iters=True`
 default; `ModelBuilder` explicitly disables it for MOD. This API example returns
 a mask at model-input resolution; `tool/infer.py` restores the original size.
 
-The old precomputed-flow dataset remains available with `--dataset opticalflow
---data_path /path/to/flow_dataset`. It trains only the segmentation head because
-the original image pairs are absent. `frame_skip` applies to the `frames` dataset.
+Training accepts only image/mask datasets. The `--dataset` option and support for
+precomputed-flow datasets have been removed; NeuFlow computes flow from each
+image pair. The `--seg_input flow` and `--seg_input flow_rgb` head modes remain
+available with image/mask datasets.
 
 Run the dataset, freeze/LR, metric, and real-model resume checks with:
 
@@ -284,8 +294,7 @@ weights are zeroed. Initial predictions match the old model, while RGB weights
 receive gradients during training. Other weights retain their values. Same-mode
 transfer is supported; conversion from a trained RGB head back to flow is
 rejected rather than silently discarding learned RGB inputs. Changing modes
-with `--resume` is rejected. The legacy `--dataset opticalflow` accepts only
-`flow`, since it has no current images.
+with `--resume` is rejected.
 
 When an external system already warps the past image into current-frame
 coordinates, explicitly disable the built-in warp:

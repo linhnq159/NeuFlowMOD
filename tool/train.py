@@ -1,4 +1,4 @@
-"""Train frame-pair motion segmentation, or the head on precomputed flow."""
+"""Train frame-pair motion segmentation from images and current-frame masks."""
 
 import json
 import math
@@ -43,11 +43,9 @@ def parse_args(argv=None):
     parser.add_argument('--learning_rate', type=float, default=0.001)
     parser.add_argument('--optim', choices=['adan', 'msam'], default='adan')
     parser.add_argument('--lr_sch', choices=['ilnet', 'cos'], default='ilnet')
-    parser.add_argument('--dataset', choices=['frames', 'opticalflow'], default='frames',
-                        help='frames: image pairs + masks; opticalflow: legacy .npy flow (head only)')
     parser.add_argument('--seg_input', choices=SEG_INPUT_MODES, default=None,
                         help='Head input; new runs use NeuFlow/config.py, resume uses checkpoint')
-    parser.add_argument('--data_path', help='Dataset root with images/ and masks/, or the legacy flow root')
+    parser.add_argument('--data_path', help='Dataset root with images/ and masks/')
     parser.add_argument('--image_dir', '--train_image_dir', dest='image_dir', help='Training image folder')
     parser.add_argument('--mask_dir', '--train_mask_dir', dest='mask_dir', help='Training ground-truth mask folder')
     parser.add_argument('--val_image_dir', help='Optional separate validation image folder')
@@ -105,26 +103,16 @@ def parse_args(argv=None):
         parser.error('--img_size WIDTH HEIGHT must be >= 32 and divisible by 16.')
     if bool(args.val_image_dir) != bool(args.val_mask_dir):
         parser.error('Provide both --val_image_dir and --val_mask_dir.')
-    if args.dataset == 'frames':
-        if args.data_path:
-            args.image_dir = args.image_dir or str(Path(args.data_path) / 'images')
-            args.mask_dir = args.mask_dir or str(Path(args.data_path) / 'masks')
-        if not args.image_dir or not args.mask_dir:
-            parser.error('Provide --image_dir and --mask_dir, or --data_path with images/ and masks/.')
-    elif not args.data_path:
-        parser.error('--dataset opticalflow requires --data_path.')
+    if args.data_path:
+        args.image_dir = args.image_dir or str(Path(args.data_path) / 'images')
+        args.mask_dir = args.mask_dir or str(Path(args.data_path) / 'masks')
+    if not args.image_dir or not args.mask_dir:
+        parser.error('Provide --image_dir and --mask_dir, or --data_path with images/ and masks/.')
     return args
 
 
 def build_datasets(args):
     args.seg_input = resolve_seg_input(args.seg_input, load_checkpoint(args.resume) if args.resume else None)
-    if args.dataset == 'opticalflow':
-        if args.seg_input != 'flow':
-            raise ValueError('seg_input=flow_rgb requires --dataset frames with current RGB images.')
-        from external.ILNet.utils.data import CustomDatasetOpticalFlow
-        print('Precomputed optical flow: training the segmentation head only.')
-        return (CustomDatasetOpticalFlow(args.data_path, mode='train', args=args),
-                CustomDatasetOpticalFlow(args.data_path, mode='test', args=args))
     if args.stabilization is None:
         args.stabilization = resolve_stabilization(None, load_checkpoint(args.resume) if args.resume else None)
     options = dict(img_size=args.img_size, frame_skip=args.frame_skip, stabilization=args.stabilization)
@@ -175,8 +163,6 @@ class Trainer:
         if args.teacher:
             teacher_checkpoint = load_checkpoint(args.teacher)
             teacher_mode = resolve_seg_input(checkpoint=teacher_checkpoint)
-            if args.dataset == 'opticalflow' and teacher_mode != 'flow':
-                raise ValueError('A flow_rgb teacher requires the frames dataset.')
             self.teacher = ModelBuilder(seg_input=teacher_mode).to(self.device)
             load_model_weights(self.teacher, teacher_checkpoint)
             self.teacher.requires_grad_(False).eval()
@@ -263,7 +249,7 @@ class Trainer:
         return optimizer, scheduler
 
     def _set_backbone_training(self, epoch):
-        enabled = self.args.dataset == 'frames' and epoch >= self.args.epoch_training_backbone
+        enabled = epoch >= self.args.epoch_training_backbone
         if enabled != getattr(self, 'backbone_training', None):
             print(f'Epoch {epoch}: backbone {"trainable" if enabled else "frozen"}; '
                   f'LR ratio = {self.args.backbone_layer_lr}')
@@ -275,8 +261,6 @@ class Trainer:
                 parameter.grad = None
 
     def _forward(self, model, images):
-        if self.args.dataset == 'opticalflow':
-            return model.seg_head(images[0])
         return model(*images, iters_s16=self.args.iters_s16, iters_s8=self.args.iters_s8)
 
     def _loss(self, output, labels, epoch):

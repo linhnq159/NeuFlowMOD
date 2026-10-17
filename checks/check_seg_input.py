@@ -25,7 +25,7 @@ from tool.checkpoints import (load_checkpoint, load_model_weights, resolve_seg_i
 from tool.export_seg import ExportModel, compare_logits, export_model, validation_pairs
 from tool.benchmark_seg import compare_timings, cost_estimate, make_model_pair, stats
 from tool.infer import parse_args as infer_args, resolve_config, run_inference
-from tool.train import Trainer, build_datasets, parse_args as train_args
+from tool.train import Trainer, parse_args as train_args
 from checks.check_frame_training import make_sequence, QuietProgress
 
 
@@ -43,14 +43,11 @@ class ConfigurationChecks(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'seg_input'):
             ModelBuilder('rgb')
 
-    def test_checkpoint_conflict_and_flow_only_dataset_rejected_early(self):
+    def test_checkpoint_conflict_and_resume_transfer_rejected_early(self):
         with self.assertRaisesRegex(ValueError, 'conflicts'):
             resolve_seg_input('flow_rgb', {})
         with self.assertRaisesRegex(ValueError, 'conflicts'):
             resolve_seg_input('flow', {'args': {'seg_input': 'flow_rgb'}})
-        args = train_args(['--dataset', 'opticalflow', '--data_path', '/not/needed', '--seg_input', 'flow_rgb'])
-        with self.assertRaisesRegex(ValueError, 'requires --dataset frames'):
-            build_datasets(args)
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             train_args(['--data_path', '/not/needed', '--resume', 'a.pth', '--transfer', 'b.pth'])
 
