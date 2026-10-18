@@ -17,7 +17,7 @@ from torch import nn
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from data_utils.frame_mask_dataset import FrameMaskDataset
+from data_utils.frame_mask_dataset import FrameMaskDataset, collate_frame_masks
 from tool.train import Trainer, build_datasets, load_checkpoint, load_weights, parse_args
 from external.ILNet.model.metrics import PD_FA
 
@@ -94,6 +94,42 @@ class DatasetChecks(unittest.TestCase):
         self.assertEqual(past.shape, current.shape)
         self.assertEqual(mask.shape, (1, 48, 64))
         self.assertEqual(set(mask.unique().tolist()), {0.0, 1.0})
+
+    def test_different_mask_resolution_with_native_and_explicit_resize(self):
+        values = np.random.default_rng(8).integers(0, 256, (35, 47, 3), dtype=np.uint8)
+        for index in (1, 2):
+            Image.fromarray(values).save(self.images / f'frame_{index}.png')
+        mask = np.zeros((16, 16), dtype=np.uint8)
+        mask[3:8, 6:10] = 255
+        Image.fromarray(mask).save(self.masks / 'frame_2.bmp')
+        for resize in (None, (61, 39)):
+            with self.subTest(resize=resize):
+                dataset = (FrameMaskDataset(self.images, self.masks) if resize is None else
+                           FrameMaskDataset(self.images, self.masks, img_size=resize))
+                current, past, target = dataset[0]
+                size = resize or (47, 35)
+                self.assertEqual(current.shape, (3, size[1], size[0]))
+                self.assertEqual(past.shape, current.shape)
+                expected_image = Image.fromarray(values)
+                if resize is not None:
+                    expected_image = expected_image.resize(resize, Image.Resampling.BILINEAR)
+                np.testing.assert_array_equal(current.permute(1, 2, 0).numpy(), np.array(expected_image))
+                expected_mask = np.array(Image.fromarray(mask).resize(size, Image.Resampling.NEAREST)) > 0
+                np.testing.assert_array_equal(target[0].numpy(), expected_mask)
+                self.assertEqual(set(target.unique().tolist()), {0.0, 1.0})
+
+    def test_mixed_resolution_batches_require_resize(self):
+        images, masks = make_sequence(self.root / 'other', count=3)
+        for path in images.glob('*.png'):
+            Image.new('RGB', (47, 35)).save(path)
+        first = FrameMaskDataset(self.images, self.masks)[0]
+        second = FrameMaskDataset(images, masks)[0]
+        with self.assertRaisesRegex(ValueError, '--resize WIDTH HEIGHT'):
+            collate_frame_masks([first, second])
+        resized = FrameMaskDataset(images, masks, img_size=(32, 32))[0]
+        batch = collate_frame_masks([first, resized])
+        self.assertEqual([tensor.shape for tensor in batch],
+                         [(2, 3, 32, 32), (2, 3, 32, 32), (2, 1, 32, 32)])
 
     def test_lossless_mask_encodings_and_palette(self):
         mask_path = self.masks / 'frame_2.bmp'
@@ -235,9 +271,19 @@ class DatasetChecks(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Ambiguous mask'):
             self.dataset()
         (self.masks / 'frame_2.png').unlink()
-        Image.new('L', (16, 32)).save(self.masks / 'frame_2.bmp')
+        Image.new('RGB', (16, 32)).save(self.images / 'frame_2.png')
         with self.assertRaisesRegex(ValueError, 'sizes differ'):
             self.dataset()[0]
+
+    def test_resize_cli_defaults_alias_and_arbitrary_dimensions(self):
+        base = ['--data_path', str(self.root)]
+        self.assertIsNone(parse_args(base).img_size)
+        for option in ('--resize', '--img_size'):
+            self.assertEqual(parse_args(base + [option, '47', '35']).img_size, [47, 35])
+            for size in (['31', '32'], ['32', '0'], ['-1', '32']):
+                with self.subTest(option=option, size=size), contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        parse_args(base + [option, *size])
 
     def test_cli_and_explicit_validation_overlap(self):
         args = parse_args(['--data_path', str(self.root), '--frame_skip', '2', '--img_size', '64', '32'])
@@ -275,6 +321,24 @@ class TinyModel(nn.Module):
 
 
 class MetricChecks(unittest.TestCase):
+    def test_false_alarm_uses_evaluated_pixels_and_reset(self):
+        for legacy_size in (None, (16, 16)):
+            metric = PD_FA(legacy_size)
+            self.assertEqual(metric.get(0), (0.0, 0.0))
+            for shape in ((1, 1, 16, 16), (2, 1, 32, 48)):
+                labels = torch.zeros(shape)
+                prediction = torch.full(shape, -1.0)
+                prediction[:, :, 2:4, 2:4] = 1
+                metric.update(prediction, labels)
+            pixels = 16 * 16 + 2 * 32 * 48
+            self.assertEqual(metric.total_pixels, pixels)
+            self.assertEqual(metric.get(3), (12 / pixels, 0.0))
+            metric.reset()
+            self.assertEqual(metric.total_pixels, 0)
+            self.assertEqual(metric.get(0), (0.0, 0.0))
+            metric.update(prediction, labels)
+            self.assertEqual(metric.get(2), (8 / (2 * 32 * 48), 0.0))
+
     def test_perfect_batch_detection_and_equal_area_false_alarm(self):
         target = torch.zeros(2, 1, 16, 16)
         target[:, :, 2:4, 2:4] = 1

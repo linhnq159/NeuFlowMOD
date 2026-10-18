@@ -130,21 +130,25 @@ class AlignmentChecks(unittest.TestCase):
             current, past, _ = textured_pair()
             Image.fromarray(past).save(images / '0.png')
             Image.fromarray(current).save(images / '1.png')
-            mask = np.zeros(current.shape[:2], dtype=np.uint8)
-            mask[130:190, 210:250] = 255
+            mask = np.zeros((192, 256), dtype=np.uint8)
+            mask[65:95, 105:125] = 255
             Image.fromarray(mask).save(masks / '1.png')
-            dataset = FrameMaskDataset(images, masks, img_size=(320, 240), stabilization='homography')
-            current_tensor, past_tensor, target = dataset[0]
-            infer_current, infer_past, info, original = load_frame_pair(
-                images / '1.png', images / '0.png', (320, 240), 'homography')
-            self.assertTrue(info.success, info.summary())
-            self.assertEqual(original, (512, 384))
-            torch.testing.assert_close(current_tensor, infer_current, rtol=0, atol=0)
-            torch.testing.assert_close(past_tensor, infer_past, rtol=0, atol=0)
-            expected_current = np.array(Image.fromarray(current).resize((320, 240), Image.Resampling.BILINEAR))
-            np.testing.assert_array_equal(current_tensor.permute(1, 2, 0).numpy(), expected_current)
-            expected_mask = np.array(Image.fromarray(mask).resize((320, 240), Image.Resampling.NEAREST)) > 0
-            np.testing.assert_array_equal(target[0].numpy(), expected_mask)
+            for resize in (None, (320, 240)):
+                with self.subTest(resize=resize):
+                    dataset = FrameMaskDataset(images, masks, img_size=resize, stabilization='homography')
+                    current_tensor, past_tensor, target = dataset[0]
+                    infer_current, infer_past, info, original = load_frame_pair(
+                        images / '1.png', images / '0.png', resize, 'homography')
+                    self.assertTrue(info.success, info.summary())
+                    self.assertEqual(original, (512, 384))
+                    torch.testing.assert_close(current_tensor, infer_current, rtol=0, atol=0)
+                    torch.testing.assert_close(past_tensor, infer_past, rtol=0, atol=0)
+                    expected_current = np.array(Image.fromarray(current).resize(
+                        resize or original, Image.Resampling.BILINEAR))
+                    np.testing.assert_array_equal(current_tensor.permute(1, 2, 0).numpy(), expected_current)
+                    expected_mask = np.array(Image.fromarray(mask).resize(
+                        resize or original, Image.Resampling.NEAREST)) > 0
+                    np.testing.assert_array_equal(target[0].numpy(), expected_mask)
 
     def test_warning_once_per_reason_in_dataset(self):
         with tempfile.TemporaryDirectory() as directory:

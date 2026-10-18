@@ -210,7 +210,7 @@ def cal_tp_pos_fp_neg(output, target, score_thresh):
 
 
 class PD_FA:
-    def __init__(self, img_size):
+    def __init__(self, img_size=None):
         super(PD_FA, self).__init__()
         self.image_area_total = []
         self.image_area_match = []
@@ -218,10 +218,12 @@ class PD_FA:
         self.FA = 0
         self.PD = 0
         self.target = 0
+        self.total_pixels = 0
 
     def update(self, preds, labels):
         predictions = (preds.detach().squeeze(1).cpu().numpy() > 0)
         targets = (labels.detach().squeeze(1).cpu().numpy() > 0)
+        self.total_pixels += targets.size
         # Connected components must be computed independently for each image.
         for prediction, target in zip(predictions, targets):
             unmatched = list(measure.regionprops(measure.label(prediction, connectivity=2)))
@@ -241,7 +243,9 @@ class PD_FA:
 
     def get(self, img_num):
 
-        Final_FA = self.FA / ((self.img_size[0] * self.img_size[1]) * img_num)
+        # Keep img_size/get(img_num) compatible with existing callers; actual
+        # evaluated pixels also support batches with different resolutions.
+        Final_FA = self.FA / self.total_pixels if self.total_pixels else 0.0
         Final_PD = self.PD / self.target if self.target else 0.0
 
         return Final_FA, Final_PD
@@ -252,3 +256,4 @@ class PD_FA:
         self.FA = 0
         self.PD = 0
         self.target = 0
+        self.total_pixels = 0

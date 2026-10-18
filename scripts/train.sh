@@ -30,6 +30,8 @@ Optional environment configuration:
 All other arguments are forwarded unchanged and override environment defaults.
 The Python trainer controls batch size, resolution, iterations, loss and device.
 New runs default to training-time homography stabilization.
+Frames keep their original resolution unless --resize WIDTH HEIGHT is supplied.
+Masks always resize to match; --img_size is an alias for --resize.
 HELP
 }
 

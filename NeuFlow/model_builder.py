@@ -119,8 +119,15 @@ class ModelBuilder(nn.Module):
         if img0.shape != img1.shape or img0.ndim != 4 or img0.shape[1] != 3:
             raise ValueError('Expected two RGB frames with matching [B, 3, H, W] shapes.')
         batch_size, _, height, width = img0.shape
-        if min(height, width) < 32 or height % 16 or width % 16:
-            raise ValueError('Frame height and width must be >= 32 and divisible by 16.')
+        if min(height, width) < 32:
+            raise ValueError('Frame height and width must be >= 32.')
+        original_height, original_width = height, width
+        pad_height, pad_width = (-height) % 16, (-width) % 16
+        if pad_height or pad_width:
+            padding = (0, pad_width, 0, pad_height)
+            img0 = F.pad(img0, padding, mode='replicate')
+            img1 = F.pad(img1, padding, mode='replicate')
+            height, width = height + pad_height, width + pad_width
         amp = img0.is_cuda and torch.is_autocast_enabled()
         init_key = (batch_size, height, width, img0.device, amp)
         if self._flow_init_key != init_key:
@@ -138,4 +145,8 @@ class ModelBuilder(nn.Module):
             rgb = img0.to(dtype=head_input.dtype) / 255.0
             head_input = torch.cat((head_input, rgb), dim=1)
         output_seg = self.seg_head(head_input)
+        if pad_height or pad_width:
+            if isinstance(output_seg, (list, tuple)):
+                return type(output_seg)(pred[..., :original_height, :original_width] for pred in output_seg)
+            return output_seg[..., :original_height, :original_width]
         return output_seg

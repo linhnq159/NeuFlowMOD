@@ -26,7 +26,9 @@ def parse_args(argv=None):
     parser.add_argument('--current', required=True, help='Current RGB or grayscale image')
     parser.add_argument('--past', required=True, help='Past image, with the same original size')
     parser.add_argument('--output', required=True, help='Output PNG mask in current-frame coordinates')
-    parser.add_argument('--img_size', nargs=2, type=int, metavar=('WIDTH', 'HEIGHT'))
+    parser.add_argument('--resize', '--img_size', dest='img_size', nargs=2, type=int,
+                        metavar=('WIDTH', 'HEIGHT'),
+                        help='Override checkpoint resize; native-size checkpoints keep original frames')
     parser.add_argument('--iters_s16', type=int)
     parser.add_argument('--iters_s8', type=int)
     parser.add_argument('--seg_input', choices=SEG_INPUT_MODES,
@@ -50,10 +52,9 @@ def resolve_config(args, checkpoint):
     for name, default in [('img_size', [960, 544]), ('iters_s16', 1), ('iters_s8', 8)]:
         if getattr(args, name) is None:
             setattr(args, name, saved.get(name, default))
-    if (not isinstance(args.img_size, (list, tuple)) or len(args.img_size) != 2
-            or any(isinstance(n, bool) or not isinstance(n, int) or n < 32 or n % 16
-                   for n in args.img_size)):
-        raise ValueError('img_size WIDTH HEIGHT must be integers >= 32 and divisible by 16.')
+    if args.img_size is not None and (not isinstance(args.img_size, (list, tuple)) or len(args.img_size) != 2
+            or any(type(n) is not int or n < 32 for n in args.img_size)):
+        raise ValueError('img_size WIDTH HEIGHT must be integers >= 32, or None for native size.')
     for name in ('iters_s16', 'iters_s8'):
         value = getattr(args, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -73,7 +74,7 @@ def run_inference(args):
     current, past, alignment, original_size = load_frame_pair(
         current_path, past_path, args.img_size, args.stabilization)
     print(alignment.summary())
-    print(f'Input size: {args.img_size}; iterations S16/S8: {args.iters_s16}/{args.iters_s8}; '
+    print(f'Input size: {current.shape[-1]}x{current.shape[-2]}; iterations S16/S8: {args.iters_s16}/{args.iters_s8}; '
           f'seg_input: {args.seg_input}')
     device = torch.device(args.device)
     model = ModelBuilder(seg_input=args.seg_input).to(device)

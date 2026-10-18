@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from data_utils.frame_mask_dataset import FrameMaskDataset
+from data_utils.frame_mask_dataset import FrameMaskDataset, collate_frame_masks
 from data_utils.frame_pair import init_frame_worker
 from tool.checkpoints import (load_checkpoint, load_weights, load_model_weights,
                               resolve_stabilization, resolve_seg_input, transfer_model_weights)
@@ -35,7 +35,9 @@ from external.ILNet.loss.custom_loss import CustomLoss
 def parse_args(argv=None):
     parser = ArgumentParser(description=__doc__)
     parser.add_argument('--work_dir', default='work_seg/checkpoint')
-    parser.add_argument('--img_size', nargs=2, type=int, default=[960, 544], metavar=('WIDTH', 'HEIGHT'))
+    parser.add_argument('--resize', '--img_size', dest='img_size', nargs=2, type=int,
+                        metavar=('WIDTH', 'HEIGHT'),
+                        help='Resize frames and masks; omitted: keep frames native and resize masks to match')
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--epochs', type=int, default=600)
@@ -99,8 +101,8 @@ def parse_args(argv=None):
         parser.error('Require 0 <= warm_up_epochs < epochs; use --warm_up_epochs 0 for short runs.')
     if not 0 <= args.val_split < 1 or not 0 <= args.alpha <= 1 or args.T <= 0:
         parser.error('Require 0 <= val_split < 1, 0 <= alpha <= 1, and T > 0.')
-    if min(args.img_size) < 32 or any(size % 16 for size in args.img_size):
-        parser.error('--img_size WIDTH HEIGHT must be >= 32 and divisible by 16.')
+    if args.img_size is not None and min(args.img_size) < 32:
+        parser.error('--resize WIDTH HEIGHT must be >= 32.')
     if bool(args.val_image_dir) != bool(args.val_mask_dir):
         parser.error('Provide both --val_image_dir and --val_mask_dir.')
     if args.data_path:
@@ -142,7 +144,7 @@ class Trainer:
         if len(self.train_set) < 2:
             raise ValueError('Training needs at least two frame pairs for the head BatchNorm.')
         loader_args = dict(num_workers=args.num_workers, pin_memory=self.device.type == 'cuda',
-                           worker_init_fn=init_frame_worker)
+                           worker_init_fn=init_frame_worker, collate_fn=collate_frame_masks)
         batch_size = min(args.batch_size, len(self.train_set))
         # Global-pooling BatchNorm cannot train on a final batch of one sample.
         self.train_data_loader = DataLoader(self.train_set, batch_size=batch_size, shuffle=True,
@@ -152,7 +154,7 @@ class Trainer:
         print(f'Train: {len(self.train_set)} pairs; validation: {len(self.val_set) if self.val_set is not None else 0}; '
               f'batch size: {batch_size}; frame_skip: {args.frame_skip}; '
               f'iterations S16/S8: {args.iters_s16}/{args.iters_s8}; stabilization: {args.stabilization}; '
-              f'seg_input: {args.seg_input}')
+              f'seg_input: {args.seg_input}; resize: {args.img_size or "native (masks match frames)"}')
         self.model = ModelBuilder(seg_input=args.seg_input).to(self.device)
         if not args.resume:
             if args.transfer:

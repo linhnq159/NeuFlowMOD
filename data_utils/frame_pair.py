@@ -142,16 +142,20 @@ def stabilize_past(current, past):
         return past, info
 
 
-def prepare_frame_pair(current, past, img_size=(960, 544), stabilization='none'):
-    """PIL frames -> current/past float RGB tensors and alignment diagnostics."""
+def prepare_frame_pair(current, past, img_size=None, stabilization='none'):
+    """PIL frames -> RGB tensors; None preserves the original resolution."""
     if stabilization not in STABILIZATION_MODES:
         raise ValueError(f'Unsupported stabilization: {stabilization}')
     if current.size != past.size:
         raise ValueError(f'Frame sizes differ: current={current.size}, past={past.size}')
-    if len(img_size) != 2 or any(not isinstance(n, int) or n < 1 for n in img_size):
-        raise ValueError('img_size must contain positive integer WIDTH HEIGHT values.')
-    current_rgb = np.array(current.convert('RGB').resize(tuple(img_size), Image.Resampling.BILINEAR))
-    past_rgb = np.array(past.convert('RGB').resize(tuple(img_size), Image.Resampling.BILINEAR))
+    if img_size is not None and (len(img_size) != 2 or
+            any(type(n) is not int or n < 1 for n in img_size)):
+        raise ValueError('img_size must be None or positive integer WIDTH HEIGHT values.')
+    current_rgb, past_rgb = current.convert('RGB'), past.convert('RGB')
+    if img_size is not None:
+        current_rgb = current_rgb.resize(tuple(img_size), Image.Resampling.BILINEAR)
+        past_rgb = past_rgb.resize(tuple(img_size), Image.Resampling.BILINEAR)
+    current_rgb, past_rgb = np.array(current_rgb), np.array(past_rgb)
     info = AlignmentInfo(mode='none')
     if stabilization == 'homography':
         past_rgb, info = stabilize_past(current_rgb, past_rgb)
@@ -160,7 +164,7 @@ def prepare_frame_pair(current, past, img_size=(960, 544), stabilization='none')
     return current_tensor, past_tensor, info
 
 
-def load_frame_pair(current_path, past_path, img_size=(960, 544), stabilization='none'):
+def load_frame_pair(current_path, past_path, img_size=None, stabilization='none'):
     with Image.open(current_path) as current, Image.open(past_path) as past:
         tensors = prepare_frame_pair(current, past, img_size, stabilization)
         return (*tensors, current.size)

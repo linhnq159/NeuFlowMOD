@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import numpy as np
+from PIL import Image
 import torch
 import torch.nn.functional as F
 
@@ -22,7 +23,7 @@ from NeuFlow.model_builder import ModelBuilder
 from external.ILNet.model.LW_Opticalflow import SEBlock
 from tool.checkpoints import (load_checkpoint, load_model_weights, resolve_seg_input,
                               transfer_model_weights)
-from tool.export_seg import ExportModel, compare_logits, export_model, validation_pairs
+from tool.export_seg import ExportModel, compare_logits, export_model, validation_pairs, main as export_main
 from tool.benchmark_seg import compare_timings, cost_estimate, make_model_pair, stats
 from tool.infer import parse_args as infer_args, resolve_config, run_inference
 from tool.train import Trainer, parse_args as train_args
@@ -34,6 +35,26 @@ def checkpoint_of(model):
 
 
 class ConfigurationChecks(unittest.TestCase):
+    def test_native_checkpoint_resize_and_static_export_size(self):
+        command = ['--checkpoint', 'm.pth', '--current', 'a.png', '--past', 'b.png', '--output', 'out.png']
+        saved = {'args': {'img_size': None}}
+        self.assertIsNone(resolve_config(infer_args(command), saved).img_size)
+        for option in ('--resize', '--img_size'):
+            args = resolve_config(infer_args(command + [option, '47', '35']), saved)
+            self.assertEqual(args.img_size, [47, 35])
+        with patch('tool.export_seg.load_checkpoint', return_value=saved), \
+                patch('tool.export_seg.ModelBuilder') as model, \
+                patch('tool.export_seg.load_model_weights'), \
+                patch('tool.export_seg.export_model') as export:
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                export_main(['--checkpoint', 'm.pth', '--output', 'out.onnx'])
+            self.assertEqual(error.exception.code, 2)
+            model.assert_not_called()
+            with self.assertRaisesRegex(ValueError, 'divisible by 16'):
+                export_main(['--checkpoint', 'm.pth', '--output', 'out.onnx', '--img_size', '47', '35'])
+            export_main(['--checkpoint', 'm.pth', '--output', 'out.onnx', '--img_size', '48', '48'])
+            self.assertEqual(export.call_args.args[2], [48, 48])
+
     def test_defaults_and_legacy_checkpoint_ignore_changed_global_config(self):
         with patch.object(config, 'seg_input', 'flow_rgb'):
             self.assertEqual(ModelBuilder().seg_input, 'flow_rgb')
@@ -63,6 +84,22 @@ class ConfigurationChecks(unittest.TestCase):
 class ModelChecks(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(42)
+
+    def test_native_size_eval_matches_padded_reference_without_mutating_inputs(self):
+        current, past = torch.rand(1, 3, 35, 47) * 255, torch.rand(1, 3, 35, 47) * 255
+        before_current, before_past = current.clone(), past.clone()
+        for mode in config.SEG_INPUT_MODES:
+            with self.subTest(mode=mode):
+                model = ModelBuilder(mode).eval()
+                with torch.inference_mode():
+                    output = model(current, past, iters_s8=2)
+                    reference = model(F.pad(current, (0, 1, 0, 13), mode='replicate'),
+                                      F.pad(past, (0, 1, 0, 13), mode='replicate'), iters_s8=2)
+                self.assertEqual(output.shape, (1, 1, 35, 47))
+                self.assertEqual(reference.shape, (1, 1, 48, 48))
+                torch.testing.assert_close(output, reference[..., :35, :47], rtol=0, atol=0)
+                torch.testing.assert_close(current, before_current, rtol=0, atol=0)
+                torch.testing.assert_close(past, before_past, rtol=0, atol=0)
 
     def test_channel_order_normalization_and_pool_flow_only(self):
         model = ModelBuilder('flow_rgb').eval()
@@ -134,8 +171,9 @@ class ModelChecks(unittest.TestCase):
                     deltas.append(output[1])
                 handles = [model.backbone_op.refine_s16.register_forward_hook(retain),
                            model.backbone_op.refine_s8.register_forward_hook(retain)]
-                current, past = torch.rand(2, 3, 32, 32) * 255, torch.rand(2, 3, 32, 32) * 255
+                current, past = torch.rand(2, 3, 35, 47) * 255, torch.rand(2, 3, 35, 47) * 255
                 outputs = model(current, past, iters_s16=2, iters_s8=3)
+                self.assertTrue(all(out.shape == (2, 1, 35, 47) for out in outputs))
                 loss = sum(F.binary_cross_entropy_with_logits(out, torch.ones_like(out)) for out in outputs)
                 loss.backward()
                 for handle in handles:
@@ -175,6 +213,41 @@ class ModelChecks(unittest.TestCase):
 
 
 class TrainingChecks(unittest.TestCase):
+    @patch('tool.train.tqdm', QuietProgress)
+    def test_native_size_train_resume_and_infer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            images, masks = make_sequence(root, count=3)
+            for path in images.glob('*.png'):
+                with Image.open(path) as image:
+                    resized = image.resize((47, 35))
+                resized.save(path)
+            for path in masks.glob('*.bmp'):
+                with Image.open(path) as mask:
+                    resized = mask.resize((16, 16), Image.Resampling.NEAREST)
+                resized.save(path)
+            options = ['--data_path', str(root), '--val_split', '0', '--batch_size', '2',
+                       '--num_workers', '0', '--device', 'cpu', '--no-amp', '--no-tensorboard',
+                       '--epochs', '2', '--warm_up_epochs', '0', '--loss', 'BCE',
+                       '--backbone_op_pretrained', '', '--work_dir', str(root / 'runs'),
+                       '--stabilization', 'none', '--epoch_training_backbone', '1', '--iters_s8', '2']
+            trainer = Trainer(train_args(options))
+            self.assertTrue(np.isfinite(trainer.training(1)))
+            trainer.save_checkpoint(1)
+            path = trainer.save_pth3 / 'last.pth'
+            self.assertIsNone(load_checkpoint(path)['args']['img_size'])
+            self.assertIsNone(json.loads((trainer.save_folder3 / 'config.json').read_text())['img_size'])
+            resumed = Trainer(train_args(options + ['--resume', str(path)]))
+            self.assertIsNone(resumed.args.img_size)
+            self.assertEqual(resumed.args.start_epoch, 2)
+            self.assertTrue(np.isfinite(resumed.training(2)))
+            args = infer_args(['--checkpoint', str(path), '--current', str(images / 'frame_2.png'),
+                               '--past', str(images / 'frame_1.png'), '--output', str(root / 'mask.png'),
+                               '--device', 'cpu', '--no-amp'])
+            mask, _ = run_inference(args)
+            self.assertIsNone(args.img_size)
+            self.assertEqual(mask.shape, (35, 47))
+
     @patch('tool.train.tqdm', QuietProgress)
     def test_rgb_train_resume_infer_and_transfer_with_fresh_optimizer(self):
         with tempfile.TemporaryDirectory() as directory:

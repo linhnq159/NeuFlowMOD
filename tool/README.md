@@ -1,5 +1,65 @@
 # Training from image and mask folders
 
+## Quick start: MOD_ONESHOT
+
+Run the following commands from the repository root. Activate a Python
+environment with PyTorch and OpenCV; this machine has the `SEA-RAFT` environment:
+
+```bash
+cd /media/linhnq/Data5/Project/NeuFlow_MOD_1
+conda activate SEA-RAFT
+```
+
+Train with both frames and the current-frame mask resized to **960×544**:
+
+```bash
+python tool/train.py \
+  --data_path datasets/MOD_ONESHOT \
+  --resize 960 544 \
+  --batch_size 8 \
+  --num_workers 8 \
+  --frame_skip 1 \
+  --val_split 0.2 \
+  --device cuda:0
+```
+
+To keep frames at their original **1920×1080**, omit `--resize`. Only masks
+resize to 1920×1080. Choose a batch size that fits GPU memory; training requires
+at least two samples per batch:
+
+```bash
+python tool/train.py \
+  --data_path datasets/MOD_ONESHOT \
+  --batch_size 2 \
+  --num_workers 8 \
+  --frame_skip 1 \
+  --val_split 0.2 \
+  --device cuda:0
+```
+
+`--img_size 960 544` is equivalent to `--resize 960 544`. Images belong under
+`datasets/MOD_ONESHOT/images/` and masks under `datasets/MOD_ONESHOT/masks/`,
+with matching sequence folders and filename stems. Only the current frame
+needs a mask; unmasked frames can still be used as past frames. `frame_skip=1`
+pairs adjacent images, and `val_split=0.2` reserves the last 20% of each sequence
+for validation. Use `--val_split 0` to disable validation.
+
+The trainer prints the checkpoint directory at startup and saves
+`checkpoint/last.pth` after every epoch under
+`work_seg/checkpoint/<run_name>/`. Resume a resized run with its actual checkpoint:
+
+```bash
+python tool/train.py \
+  --data_path datasets/MOD_ONESHOT \
+  --resize 960 544 \
+  --resume /path/to/run/checkpoint/last.pth \
+  --device cuda:0
+```
+
+Repeat the original resize, batch, frame-skip and other training settings when
+resuming. For a run using original-size frames, omit `--resize` on resume too.
+To inspect all available options, run `python tool/train.py --help`.
+
 ## Launch scripts
 
 Activate your PyTorch environment first, or set `PYTHON_BIN=/path/to/python`.
@@ -77,7 +137,7 @@ python tool/train.py \
   --stabilization homography \
   --iters_s16 1 \
   --iters_s8 8 \
-  --img_size 960 544 \
+  --resize 960 544 \
   --epoch_training_backbone 300 \
   --backbone_layer_lr 0.1
 ```
@@ -119,10 +179,34 @@ converting a compressed JPEG mask to PNG does not recover its original labels.
 Input images can still be JPEG or any other previously supported image format.
 
 Masks are binary: zero is background, positive values are foreground, including
-both 0/1 and 0/255 encodings. PNG palette masks use their class IDs. Images and
-their masks must originally have matching dimensions. Both frames resize to
-`--img_size WIDTH HEIGHT`; masks use nearest-neighbor resizing. Images convert
-to RGB in the range 0–255, as expected by NeuFlow.
+both 0/1 and 0/255 encodings. PNG palette masks use their class IDs. A mask can
+have a different resolution from its image, but must describe the same full
+frame (without cropping or padding). The two input frames must have matching
+original dimensions. Images convert to RGB in the range 0–255, as expected by NeuFlow.
+
+`--resize WIDTH HEIGHT` resizes both frames with bilinear interpolation and
+the mask with nearest-neighbor interpolation. `--img_size` is an alias for
+the same option. Each requested dimension must be at least 32; multiples of
+16 are not required for training or PyTorch inference.
+
+Without either option, frames keep their original resolution and only the
+mask resizes to match the current frame. For example, `MOD_ONESHOT` images
+are 1920×1080 and its masks are 960×544:
+
+```bash
+# Frames and masks become 960×544.
+python tool/train.py --data_path datasets/MOD_ONESHOT --resize 960 544
+
+# Frames stay 1920×1080; masks resize to 1920×1080.
+python tool/train.py --data_path datasets/MOD_ONESHOT
+```
+
+ModelBuilder replicates the right/bottom edge to reach multiples of 16
+internally, then crops every prediction (including training auxiliary outputs)
+back to the requested or native resolution before loss/metrics. For 1920×1080,
+computation uses 1920×1088 and predictions remain 1920×1080. PD/FA normalizes
+false alarms by the actual number of evaluated pixels. Samples within each
+batch must share a resolution; use `--resize` if native resolutions differ.
 
 ## Stabilizing the past frame
 
@@ -183,8 +267,11 @@ use e.g. `--device cpu --img_size 32 32
 Checkpoints are written under `--work_dir`, with `checkpoint/last.pth` saved each
 epoch, even when validation is disabled. Resume with the same data, scheduler
 and iteration settings and `--resume /path/to/checkpoint/last.pth`. Checkpoints
-save `iters_s16`/`iters_s8` in their arguments. Older checkpoints without these
-fields still load with the CLI defaults of 1/8. Checkpoints from the earlier
+save `img_size` as the selected `[WIDTH, HEIGHT]`, or `null` for native frames,
+and save `iters_s16`/`iters_s8` in their arguments. Training uses the current
+CLI resize choice, including on resume; repeat `--resize` to keep a resized run.
+Older checkpoints without the iteration fields still load with the CLI defaults
+of 1/8. Checkpoints from the earlier
 single-parameter-group optimizer should instead be loaded with `--transfer` to
 initialize weights and start a new optimizer.
 
@@ -207,9 +294,11 @@ and `--threshold` (default 0.5), and writes a single-channel PNG containing 0/25
 The output remains in current-frame coordinates. Missing output directories are
 created; either input image and the checkpoint are protected from overwrite.
 
-`--img_size WIDTH HEIGHT`, `--iters_s16` and `--iters_s8` override checkpoint
-settings. If neither CLI nor checkpoint supplies them, defaults are 960×544,
-S16=1 and S8=8. Stabilization follows the checkpoint rules above. `--device`
+`--resize WIDTH HEIGHT` (alias `--img_size`), `--iters_s16` and `--iters_s8`
+override checkpoint settings. A checkpoint with `img_size: null` keeps the
+original frame size; an explicit resize overrides it. Legacy checkpoints with
+no size setting retain the 960×544 fallback. Missing iteration settings default
+to S16=1 and S8=8. Stabilization follows the checkpoint rules above. `--device`
 defaults to CUDA when available, otherwise CPU; `--no-amp` disables CUDA AMP.
 The script prints alignment success/fallback and the chosen model input size.
 
@@ -325,6 +414,10 @@ This exports **NeuFlow plus segmentation**, with fixed batch one, FP32 NCHW
 concatenation are inside the graph; camera warp, image resize and output
 thresholding remain outside. The old root `pt2onnx.py` exports only optical
 flow and should not be used for these segmentation checkpoints.
+
+Static export still requires both dimensions to be at least 32 and divisible
+by 16. When the checkpoint uses native-size frames (`img_size: null`), provide
+an explicit `--img_size WIDTH HEIGHT` for export.
 
 Export works on a copy, replacing each zero-hidden-channel SE block with its
 exact `x * 0.5` equivalent. It checks the ONNX model and compares logits against

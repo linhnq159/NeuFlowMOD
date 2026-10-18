@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import Dataset, get_worker_info
+from torch.utils.data import Dataset, default_collate, get_worker_info
 from data_utils.frame_pair import STABILIZATION_MODES, prepare_frame_pair
 
 
@@ -22,6 +22,15 @@ def natural_key(path):
                  for part in re.split(r'(\d+)', str(path)))
 
 
+def collate_frame_masks(batch):
+    """Stack equally sized samples, with an actionable error for native-size data."""
+    shapes = {tuple(tensor.shape[-2:]) for sample in batch for tensor in sample}
+    if len(shapes) != 1:
+        raise ValueError('Frame/mask sizes differ within a batch. '
+                         'Use --resize WIDTH HEIGHT to give all samples the same size.')
+    return default_collate(batch)
+
+
 class FrameMaskDataset(Dataset):
     """Each image subfolder is a sequence; masks match relative path and stem.
 
@@ -30,13 +39,14 @@ class FrameMaskDataset(Dataset):
     Temporal train/validation splits happen before constructing frame pairs.
     Only current frames with masks become targets; unmasked frames remain
     available as past frames and count toward ``frame_skip``.
+    With ``img_size=None``, frames keep their size and masks resize to match.
     """
 
-    def __init__(self, image_dir, mask_dir, img_size=(960, 544), frame_skip=1,
+    def __init__(self, image_dir, mask_dir, img_size=None, frame_skip=1,
                  split='all', val_split=0.2, stabilization='none'):
         self.image_dir = Path(image_dir).expanduser().resolve()
         self.mask_dir = Path(mask_dir).expanduser().resolve()
-        self.img_size = tuple(img_size)
+        self.img_size = tuple(img_size) if img_size is not None else None
         if stabilization not in STABILIZATION_MODES:
             raise ValueError(f'Unsupported stabilization: {stabilization}')
         self.stabilization = stabilization
@@ -45,8 +55,9 @@ class FrameMaskDataset(Dataset):
             raise ValueError('frame_skip must be at least 1 (1 means adjacent frames).')
         if split not in ('all', 'train', 'val') or not 0 <= val_split < 1:
             raise ValueError('Invalid split or val_split; require 0 <= val_split < 1.')
-        if len(self.img_size) != 2 or any(size <= 0 for size in self.img_size):
-            raise ValueError('img_size must contain positive WIDTH HEIGHT values.')
+        if self.img_size is not None and (len(self.img_size) != 2 or
+                any(type(size) is not int or size <= 0 for size in self.img_size)):
+            raise ValueError('img_size must be None or positive integer WIDTH HEIGHT values.')
         for folder in (self.image_dir, self.mask_dir):
             if not folder.is_dir():
                 raise FileNotFoundError(f'Data folder does not exist: {folder}')
@@ -105,8 +116,9 @@ class FrameMaskDataset(Dataset):
         with Image.open(source_path) as source_file, Image.open(reference_path) as reference_file, Image.open(mask_path) as mask_file:
             if mask_file.format not in MASK_FORMATS:
                 raise ValueError(f'Masks must use PNG/BMP; decoded format is {mask_file.format}: {mask_path}')
-            if source_file.size != reference_file.size or source_file.size != mask_file.size:
-                raise ValueError(f'Frame/mask sizes differ: {source_path}, {reference_path}, {mask_path}')
+            if source_file.size != reference_file.size:
+                raise ValueError(f'Frame sizes differ: {source_path}, {reference_path}')
+            target_size = self.img_size if self.img_size is not None else source_file.size
             source, reference, alignment = prepare_frame_pair(
                 source_file, reference_file, self.img_size, self.stabilization)
             worker = get_worker_info()
@@ -122,6 +134,6 @@ class FrameMaskDataset(Dataset):
                 mask = np.any(mask[..., :3] > 0, axis=-1)
             else:
                 mask = mask > 0
-            mask = Image.fromarray(mask.astype(np.uint8)).resize(self.img_size, Image.Resampling.NEAREST)
+            mask = Image.fromarray(mask.astype(np.uint8)).resize(target_size, Image.Resampling.NEAREST)
         mask = torch.from_numpy(np.array(mask, dtype=np.float32)).unsqueeze(0)
         return source, reference, mask

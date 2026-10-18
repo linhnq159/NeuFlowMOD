@@ -165,12 +165,17 @@ def main(argv=None):
     torch.set_num_threads(args.cpu_threads)
     checkpoint = load_checkpoint(args.checkpoint)
     saved = checkpoint_args(checkpoint)
+    img_size = args.img_size if args.img_size is not None else saved.get('img_size', [960, 544])
+    if img_size is None:
+        parser.error('Native-size checkpoint: provide --img_size WIDTH HEIGHT for static export '
+                     '(dimensions must be >= 32 and divisible by 16).')
+    iters_s16 = args.iters_s16 if args.iters_s16 is not None else saved.get('iters_s16', 1)
+    iters_s8 = args.iters_s8 if args.iters_s8 is not None else saved.get('iters_s8', 8)
+    validate_shape_iterations(img_size, iters_s16, iters_s8)
     mode = resolve_seg_input(args.seg_input, checkpoint)
     model = ModelBuilder(seg_input=mode).eval()
     load_model_weights(model, checkpoint)
-    export_model(model, args.output, args.img_size or saved.get('img_size', [960, 544]),
-                 args.iters_s16 if args.iters_s16 is not None else saved.get('iters_s16', 1),
-                 args.iters_s8 if args.iters_s8 is not None else saved.get('iters_s8', 8))
+    export_model(model, args.output, img_size, iters_s16, iters_s8)
 
 
 if __name__ == '__main__':
