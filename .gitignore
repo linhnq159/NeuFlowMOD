@@ -18,3 +18,5 @@ onnx_tensorrt/*
 */*.jpg
 */*png
 */*pt*
+
+work_seg/

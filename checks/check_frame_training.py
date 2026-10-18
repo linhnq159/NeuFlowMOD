@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import json
 import math
 import sys
 import tempfile
@@ -358,6 +359,30 @@ class MetricChecks(unittest.TestCase):
 
 
 class OptimizerChecks(unittest.TestCase):
+    @patch('tool.train.tqdm', QuietProgress)
+    @patch('tool.train.ModelBuilder', TinyModel)
+    def test_missing_tensorboard_still_trains_validates_and_saves(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_sequence(root, count=6)
+            args = parse_args(['--data_path', str(root), '--val_split', '0.5',
+                               '--resize', '32', '32', '--batch_size', '2', '--num_workers', '0',
+                               '--device', 'cpu', '--no-amp', '--epochs', '2', '--warm_up_epochs', '0',
+                               '--loss', 'BCE', '--backbone_op_pretrained', '', '--stabilization', 'none',
+                               '--work_dir', str(root / 'runs')])
+            self.assertTrue(args.tensorboard)
+            with patch.dict(sys.modules, {'torch.utils.tensorboard': None, 'tensorboardX': None}), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                trainer = Trainer(args)
+            self.assertIn('TensorBoard logging disabled', output.getvalue())
+            self.assertFalse(args.tensorboard)
+            self.assertIsNone(trainer.writer)
+            self.assertFalse(json.loads((trainer.save_folder3 / 'config.json').read_text())['tensorboard'])
+            self.assertTrue(math.isfinite(trainer.training(1)))
+            improved = trainer.validation(1)
+            trainer.save_checkpoint(1, improved)
+            self.assertFalse(load_checkpoint(trainer.save_pth3 / 'last.pth')['args']['tensorboard'])
+
     @patch('tool.train.tqdm', QuietProgress)
     @patch('tool.train.ModelBuilder', TinyModel)
     def test_training_validation_and_teacher_receive_iterations(self):

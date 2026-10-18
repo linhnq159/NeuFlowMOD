@@ -1,14 +1,19 @@
 """Checkpoint loading shared by the segmentation trainer and inference CLI."""
 
 from argparse import Namespace
+from contextlib import nullcontext
 
 import torch
 from NeuFlow import config
 
 
 def load_checkpoint(path):
-    # Earlier checkpoints may contain argparse.Namespace.
-    with torch.serialization.safe_globals([Namespace]):
+    # PyTorch 2.4+ can allowlist Namespace metadata from older checkpoints.
+    # On 2.3, plain state dicts and our dict-based training checkpoints still
+    # load with weights_only=True; never retry with unrestricted unpickling.
+    safe_globals = getattr(torch.serialization, 'safe_globals', None)
+    context = safe_globals([Namespace]) if safe_globals is not None else nullcontext()
+    with context:
         return torch.load(path, map_location='cpu', weights_only=True)
 
 

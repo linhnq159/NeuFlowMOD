@@ -1,24 +1,24 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+CUSTOM_LOSS_VERSION = 'custom_soft_v1'
 
 class CustomLoss(nn.Module):
     def __init__(self, beta=2.0):
         super(CustomLoss, self).__init__()
         self.beta = 1.0/beta
-        print("using custom loss")
 
     def forward_single(self, pred, target, threshold):
         """
         Calculates the forward pass of the custom loss function for a single prediction.
 
         Equation:
-            intersection = pred*(pred>threshold)*target                                         # to improve the performance
+            intersection = sigmoid(pred) * target
             Loss = 1 - ((2*intersection + smooth)/(pred^2 + target^2 + smooth))^(1/beta)
         Args:
             pred (torch.Tensor): The predicted output tensor.
             target (torch.Tensor): The target tensor.
-            threshold (float): The threshold value for binarizing the prediction. (threshold  = max_threshold*epoch/(num_epochs))
+            threshold (float): Ignored; accepted for compatibility with old callers.
 
         Returns:
             torch.Tensor: The calculated loss value.
@@ -26,12 +26,7 @@ class CustomLoss(nn.Module):
                 
         pred = torch.sigmoid(pred)
 
-        temp_pred = pred > threshold
-        temp_pred = temp_pred.float()
-
-        intersection = temp_pred * target
-
-        intersection = intersection*pred 
+        intersection = pred * target
 
         smooth = 1.0
         intersection_sum = torch.sum(intersection)
@@ -44,7 +39,7 @@ class CustomLoss(nn.Module):
     
     def forward(self, pred, target, threshold=0.3):
         
-        if isinstance(pred, list):
+        if isinstance(pred, (list, tuple)):
             loss = 0
             for i in range(len(pred)):
                 loss += self.forward_single(pred[i], target, threshold)

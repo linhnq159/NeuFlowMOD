@@ -10,6 +10,24 @@ cd /media/linhnq/Data5/Project/NeuFlow_MOD_1
 conda activate SEA-RAFT
 ```
 
+Training and PyTorch inference support **PyTorch 2.3+** with the matching
+torchvision build (for example, PyTorch 2.3 / torchvision 0.18). Check the active
+environment before running:
+
+```bash
+python -c "import sys, torch; print(sys.executable); print(torch.__version__); print('CUDA:', torch.cuda.is_available())"
+```
+
+Checkpoint loading uses `weights_only=True` on both old and new PyTorch.
+PyTorch 2.4+ additionally supports older checkpoint metadata stored as
+`argparse.Namespace`; PyTorch 2.3 supports the tensor/dictionary checkpoints
+written by this trainer and the bundled NeuFlow pretrained weights.
+
+TensorBoard is optional. If neither `tensorboard` nor `tensorboardX` is installed,
+the trainer prints a message, disables TensorBoard and continues with CSV/JSONL,
+`train.log` and checkpoints. Use `--no-tensorboard` to disable it explicitly, or
+`python -m pip install tensorboard` to enable it in the active environment.
+
 Train with both frames and the current-frame mask resized to **960×544**:
 
 ```bash
@@ -59,6 +77,173 @@ python tool/train.py \
 Repeat the original resize, batch, frame-skip and other training settings when
 resuming. For a run using original-size frames, omit `--resize` on resume too.
 To inspect all available options, run `python tool/train.py --help`.
+
+## Corrected CUSTOM loss and comparing improvements
+
+`CUSTOM` now uses **soft intersection** `sigmoid(logits) * target`, including
+low-probability foreground pixels. The original normalization, smoothing and
+exponent remain unchanged:
+
+```text
+p = sigmoid(logits)
+CUSTOM = 1 - ((2 * sum(p * target) + 1) / (sum(p * p) + sum(target) + 1)) ** (1 / beta)
+beta = 2
+```
+
+Effective configs and new checkpoints record `loss_version: custom_soft_v1`.
+Old unversioned CUSTOM runs used a thresholded intersection that could push
+low-confidence foreground predictions toward background. `--gain` and the
+Python loss argument `threshold` are still accepted for older commands/callers,
+but **have no effect on corrected CUSTOM**. Metric thresholds remain 0.5.
+Auxiliary outputs still contribute fully to the optimized training loss; model
+architecture and the default backbone unfreeze at epoch 300 are unchanged.
+
+For the reviewed run, start a **new run using `--transfer`** from its best-IoU
+checkpoint (epoch 16, IoU about 0.218). Keep the original **480×272** setup first
+to measure the loss correction without changing resolution or input mode:
+
+```bash
+python tool/train.py \
+  --data_path datasets/MOD_ONESHOT \
+  --transfer work_seg/checkpoint/L_CUSTOM_2026-10-18-17-35-56-548300/checkpoint/best_iou.pth \
+  --resize 480 272 \
+  --batch_size 4 \
+  --num_workers 6 \
+  --frame_skip 3 \
+  --val_split 0.2 \
+  --loss CUSTOM \
+  --seg_input flow \
+  --stabilization homography \
+  --learning_rate 0.001 \
+  --epoch_training_backbone 300 \
+  --backbone_layer_lr 0.1 \
+  --tb_image_freq 10 \
+  --tb_num_images 4 \
+  --device cuda:0
+```
+
+Transfer loads weights with a fresh optimizer, scheduler, best metrics and
+history. Resume restores the old optimizer/epoch and uses the corrected loss;
+the session snapshot records its source loss version. Prefer transfer for
+comparing the corrected loss against the old run. Absolute training loss values
+from the two formulas are not directly comparable. Historical epoch losses
+missing from the old run cannot be recovered; new logs begin with this code.
+
+After that baseline, run separate experiments from the **same source checkpoint**:
+
+- Change only `--resize 480 272` to `--resize 960 544` to test small-object detail.
+  Keep batch size 4 if GPU memory permits; record any batch-size change.
+- Keep the baseline resolution and change only `--seg_input flow` to
+  `--seg_input flow_rgb` to test appearance cues. Transfer initializes the RGB
+  weights to zero and copies the original flow weights.
+
+Compare `best_iou.pth`, recall, precision, `val_niou_positive` and preview images
+on the same validation split. Roughly 44.6% of the reviewed validation masks
+are empty, so an all-background prediction can look attractive under Fa alone.
+`best_FA.pth` is not the primary checkpoint for segmentation quality. Higher
+resolution or RGB inputs need validation; neither guarantees improvement.
+
+## Epoch history, sessions and TensorBoard
+
+Each run writes these files automatically, including with `--no-tensorboard`:
+
+```text
+<run>/
+  config.json                     # original effective run config
+  history.jsonl                   # one JSON object per completed epoch
+  history.csv                     # same fields, spreadsheet-friendly
+  train.log                       # startup, epoch summaries, error tracebacks
+  summary.json                    # current session status, latest epoch and bests
+  checkpoint/last.pth
+  checkpoint/best_iou.pth          # primary quality checkpoint
+  sessions/<session_id>/
+    session.json                  # config, command, runtime, resume source, samples
+    config.json                   # effective config for this invocation
+    summary.json                  # this session's status and best metadata
+    checkpoint/epoch_XXXXXX.pth    # retained only when a best metric improves
+  tensorboard/<session_id>/       # optional scalar/image event files
+```
+
+All completed epochs are appended and flushed immediately. Progress bars stay
+in the console; `train.log` contains epoch summaries rather than batch output.
+`summary.json` records `running`, `completed`, `interrupted` or `failed`, the last
+completed epoch, and each best value with its epoch and checkpoint path (paths
+are relative to the run). Startup failures are also logged. An interruption in
+the middle of an epoch keeps previously completed history and checkpoints;
+the unfinished epoch is not recorded as complete.
+
+Main fields in CSV/JSONL and checkpoint `epoch_metrics`:
+
+| Fields | Meaning |
+| --- | --- |
+| `train_loss_total` | Actual optimized loss, including every auxiliary output and optional teacher weighting |
+| `train_loss_main`, `train_loss_aux` | Unweighted supervised main loss and sum of auxiliary losses |
+| `train_loss_kd` | Raw teacher distillation loss; zero without a teacher |
+| `val_loss` | Main prediction loss only; not directly comparable to the sum of training outputs |
+| `train_iou`, `val_iou`, `*_precision`, `*_recall` | Confusion counts aggregated over evaluated pixels, at threshold 0.5 |
+| `*_target_fg_ratio`, `*_pred_fg_ratio` | Foreground pixels / all evaluated pixels, in [0, 1] |
+| `val_niou`, `val_niou_positive` | Mean per-image IoU over all images / only images with foreground in resized labels |
+| `val_positive_samples`, `val_pd`, `val_fa` | Foreground image count, object detection probability and false alarm pixel ratio |
+| `train_samples`, `val_samples` | Actually processed samples; training drops incomplete batches |
+| `lr_head`, `lr_backbone` | Sample-weighted mean LR used by successful optimizer updates, before scheduler steps |
+| `lr_*_first`, `lr_*_last` | First/last rates actually used in the epoch; backbone is zero while frozen |
+| `backbone_training` | Whether the backbone is unfrozen |
+| `train_seconds`, `val_seconds`, `epoch_seconds` | Train/validation wall time and their sum, excluding checkpoint writes |
+| `amp_scale`, `optimizer_steps`, `optimizer_skipped_steps` | Final scaler value and successful/overflow-skipped optimizer updates |
+| `gpu_peak_memory_mb` | Peak allocated PyTorch GPU memory during train+validation, in MiB; null on CPU |
+
+Loss means are weighted by sample count, including the last validation batch.
+Empty-target/empty-prediction images contribute zero to all-image nIoU, as
+before. `val_niou_positive` is null if no evaluated image has foreground. All
+validation fields are **null** on epochs skipped by `--eval_freq`, or when
+`--val_split 0` disables validation. All-skipped optimizer epochs report zero
+actual LR. With a teacher, total loss is
+`alpha * (main + aux) + (1 - alpha) * kd`.
+
+Every invocation, including resume, gets a new `session_id`, configuration
+snapshot, command line and Python/PyTorch/CUDA versions. Resume appends rows
+without deleting earlier sessions; repeated epoch numbers are distinguished by
+session ID. New checkpoint metadata uses plain dictionaries, lists and native
+Python values, compatible with PyTorch 2.3 safe loading. Best epochs absent
+from old checkpoints are recovered only when a matching best file is available;
+unknown epochs/paths remain null rather than being guessed.
+
+Best checkpoint snapshots preserve their epoch across later improvements and
+resume from earlier epochs. They share disk storage with current checkpoint
+aliases using hard links when supported; otherwise files are copied. Retaining
+earlier best epochs uses additional space. The standard `checkpoint/best_iou.pth`
+tracks the active resume branch, and session summaries retain earlier references.
+
+Install and start TensorBoard from the active training environment:
+
+```bash
+python -m pip install tensorboard
+tensorboard --logdir work_seg/checkpoint --port 6006
+```
+
+Open **http://localhost:6006**. Use **Scalars** for `Epoch/train_loss_total`,
+`Epoch/train_loss_main`, `Epoch/train_loss_aux`, validation metrics and learning
+rates. Use **Images** for each fixed sample's left-to-right comparison:
+**current RGB / ground-truth mask / predicted binary mask / probability**.
+
+The default four samples prefer three foreground masks and one empty mask,
+spread across sequences; unavailable categories are filled with other valid
+samples. The chosen frame pairs are saved in the session and checkpoint and
+kept on resume when still present. `--tb_num_images 4` changes the count.
+Images are logged on the first validation of each session, on validation epochs
+divisible by `--tb_image_freq 10`, and whenever IoU improves, at most once per
+epoch. Images/logits come directly from the validation loop, with **no extra
+forward**. Only TensorBoard event files contain images; no PNG/JPG files are
+exported. Session-specific event directories avoid overlapping curves if an
+older epoch is resumed. Missing TensorBoard leaves the persistent history intact.
+
+Run the logging/loss checks alongside the existing training checks:
+
+```bash
+python checks/check_training_logging.py
+python checks/check_frame_training.py
+python checks/check_checkpoint_compat.py
+```
 
 ## Launch scripts
 
