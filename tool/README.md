@@ -38,7 +38,8 @@ python tool/train.py \
   --num_workers 8 \
   --frame_skip 1 \
   --val_split 0.2 \
-  --device cuda:0
+  --device cuda:0 \
+  --no-amp
 ```
 
 To keep frames at their original **1920×1080**, omit `--resize`. Only masks
