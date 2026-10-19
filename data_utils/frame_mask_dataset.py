@@ -10,6 +10,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset, default_collate, get_worker_info
 from data_utils.frame_pair import STABILIZATION_MODES, prepare_frame_pair
+from data_utils.frame_augmentation import FrameMaskAugmentor
 
 
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp'}
@@ -43,10 +44,12 @@ class FrameMaskDataset(Dataset):
     """
 
     def __init__(self, image_dir, mask_dir, img_size=None, frame_skip=1,
-                 split='all', val_split=0.2, stabilization='none'):
+                 split='all', val_split=0.2, stabilization='none', augmentation=None):
         self.image_dir = Path(image_dir).expanduser().resolve()
         self.mask_dir = Path(mask_dir).expanduser().resolve()
         self.img_size = tuple(img_size) if img_size is not None else None
+        # Explicitly opt in: split='all' is also used for separate validation folders.
+        self.augmentor = FrameMaskAugmentor(augmentation) if augmentation is not None else None
         if stabilization not in STABILIZATION_MODES:
             raise ValueError(f'Unsupported stabilization: {stabilization}')
         self.stabilization = stabilization
@@ -136,4 +139,6 @@ class FrameMaskDataset(Dataset):
                 mask = mask > 0
             mask = Image.fromarray(mask.astype(np.uint8)).resize(target_size, Image.Resampling.NEAREST)
         mask = torch.from_numpy(np.array(mask, dtype=np.float32)).unsqueeze(0)
+        if self.augmentor is not None:
+            return self.augmentor(source, reference, mask)
         return source, reference, mask

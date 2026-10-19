@@ -5,6 +5,7 @@ from contextlib import nullcontext
 
 import torch
 from NeuFlow import config
+from data_utils.frame_augmentation import validate_augmentation
 
 
 def load_checkpoint(path):
@@ -20,6 +21,18 @@ def load_checkpoint(path):
 def checkpoint_args(checkpoint):
     args = checkpoint.get('args', {}) if checkpoint is not None else {}
     return vars(args) if isinstance(args, Namespace) else args
+
+
+def resolve_train_augmentation(override=None, checkpoint=None):
+    """Resume owns numeric settings; explicit CLI choices replace only enabled modes."""
+    settings = (config.train_augmentation if checkpoint is None else
+                checkpoint_args(checkpoint).get('train_augmentation', config.DEFAULT_TRAIN_AUGMENTATION))
+    settings = dict(settings)
+    if override is not None:
+        if 'none' in override and list(override) != ['none']:
+            raise ValueError('--augment none cannot be combined with other augmentations.')
+        settings['enabled'] = [] if list(override) == ['none'] else list(override)
+    return validate_augmentation(settings)
 
 
 def resolve_stabilization(override, checkpoint=None):

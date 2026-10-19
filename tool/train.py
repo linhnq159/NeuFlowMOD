@@ -21,8 +21,10 @@ from tqdm import tqdm
 
 from data_utils.frame_mask_dataset import FrameMaskDataset, collate_frame_masks
 from data_utils.frame_pair import init_frame_worker
+from data_utils.frame_augmentation import AUGMENT_MODES
 from tool.checkpoints import (load_checkpoint, load_weights, load_model_weights,
-                              resolve_stabilization, resolve_seg_input, transfer_model_weights)
+                              resolve_stabilization, resolve_seg_input, resolve_train_augmentation,
+                              transfer_model_weights)
 from NeuFlow.config import SEG_INPUT_MODES
 from NeuFlow.model_builder import ModelBuilder
 from external.ILNet.utils.Adan import Adan
@@ -63,6 +65,8 @@ def parse_args(argv=None):
     parser.add_argument('--iters_s8', type=int, default=8, help='Number of S8 refinement iterations')
     parser.add_argument('--stabilization', choices=['none', 'homography'], default=None,
                         help='Past-to-current alignment; new runs default to homography, resume uses checkpoint')
+    parser.add_argument('--augment', nargs='+', choices=('none',) + AUGMENT_MODES, default=None,
+                        help='Training augmentations; defaults from config or resume checkpoint. Use none to disable')
     parser.add_argument('--mode', default='L')
     parser.add_argument('--loss', type=str.upper, default='CUSTOM',
                         choices=['BCE', 'SOFTIOULOSS', 'DICE', 'FOCAL', 'CUSTOM', 'ASIMMUNIFOCAL', 'NAF'])
@@ -91,6 +95,9 @@ def parse_args(argv=None):
     parser.add_argument('--backbone_layer_lr', type=float, default=0.1,
                         help='Backbone LR / head LR throughout training')
     args = parser.parse_args(argv)
+    if args.augment is not None and ('none' in args.augment and args.augment != ['none']
+                                     or len(set(args.augment)) != len(args.augment)):
+        parser.error('--augment requires unique choices; none cannot be combined with other modes.')
     if args.resume and args.transfer:
         parser.error('Choose either --resume or --transfer, not both.')
     if args.batch_size < 2:
@@ -124,12 +131,14 @@ def parse_args(argv=None):
 
 
 def build_datasets(args):
-    args.seg_input = resolve_seg_input(args.seg_input, load_checkpoint(args.resume) if args.resume else None)
+    checkpoint = load_checkpoint(args.resume) if args.resume else None
+    args.seg_input = resolve_seg_input(args.seg_input, checkpoint)
     if args.stabilization is None:
-        args.stabilization = resolve_stabilization(None, load_checkpoint(args.resume) if args.resume else None)
+        args.stabilization = resolve_stabilization(None, checkpoint)
+    args.train_augmentation = resolve_train_augmentation(getattr(args, 'augment', None), checkpoint)
     options = dict(img_size=args.img_size, frame_skip=args.frame_skip, stabilization=args.stabilization)
     if args.val_image_dir:
-        train_set = FrameMaskDataset(args.image_dir, args.mask_dir, **options)
+        train_set = FrameMaskDataset(args.image_dir, args.mask_dir, augmentation=args.train_augmentation, **options)
         val_set = FrameMaskDataset(args.val_image_dir, args.val_mask_dir, **options)
         train_frames = {path.resolve() for sample in train_set.samples for path in sample[:2]}
         val_frames = {path.resolve() for sample in val_set.samples for path in sample[:2]}
@@ -137,7 +146,7 @@ def build_datasets(args):
             raise ValueError('Training and validation folders contain the same frame paths.')
     else:
         train_set = FrameMaskDataset(args.image_dir, args.mask_dir, split='train',
-                                    val_split=args.val_split, **options)
+                                    val_split=args.val_split, augmentation=args.train_augmentation, **options)
         val_set = (FrameMaskDataset(args.image_dir, args.mask_dir, split='val',
                                    val_split=args.val_split, **options) if args.val_split else None)
     return train_set, val_set
@@ -183,6 +192,7 @@ class Trainer:
               f'batch size: {batch_size}; frame_skip: {args.frame_skip}; '
               f'iterations S16/S8: {args.iters_s16}/{args.iters_s8}; stabilization: {args.stabilization}; '
               f'seg_input: {args.seg_input}; resize: {args.img_size or "native (masks match frames)"}')
+        print(f'Train augmentation: {json.dumps(args.train_augmentation, sort_keys=True)}')
         self.model = ModelBuilder(seg_input=args.seg_input).to(self.device)
         if not args.resume:
             if args.transfer:

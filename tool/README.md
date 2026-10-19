@@ -79,6 +79,102 @@ Repeat the original resize, batch, frame-skip and other training settings when
 resuming. For a run using original-size frames, omit `--resize` on resume too.
 To inspect all available options, run `python tool/train.py --help`.
 
+## Optional training augmentation
+
+Augmentation is **off by default**. Enable all three transforms for a new run:
+
+```bash
+python tool/train.py \
+  --data_path datasets/MOD_ONESHOT \
+  --resize 480 272 \
+  --batch_size 4 \
+  --num_workers 6 \
+  --frame_skip 3 \
+  --val_split 0.2 \
+  --augment hflip brightness_contrast scale \
+  --device cuda:0 \
+  --no-amp
+```
+
+Select any subset, such as `--augment hflip brightness_contrast`, or use
+`--augment none` to disable everything explicitly. Numeric settings are editable
+in `train_augmentation` in `NeuFlow/config.py`; for example:
+
+```python
+train_augmentation = deepcopy(DEFAULT_TRAIN_AUGMENTATION)
+train_augmentation.update(
+    enabled=["hflip", "brightness_contrast", "scale"],
+    hflip_p=0.5,
+    brightness_contrast_p=0.5,
+    brightness_range=[0.85, 1.15],
+    contrast_range=[0.85, 1.15],
+    zoom_out_p=0.4,
+    zoom_in_p=0.1,
+    zoom_out_range=[0.6, 1.0],
+    zoom_in_range=[1.0, 1.2],
+)
+```
+
+Edit `train_augmentation`, leaving `DEFAULT_TRAIN_AUGMENTATION` as the factory
+defaults. New runs (including `--transfer`) use this config when `--augment` is
+omitted. Resume restores all numeric settings and enabled modes from the
+checkpoint; explicit `--augment` replaces only its enabled modes. Legacy
+checkpoints without augmentation metadata default to disabled on resume.
+The effective dictionary is printed at startup and saved in `train.log`, run
+and session config JSON, and checkpoint `args.train_augmentation`.
+
+Transforms run **after the existing resize and stabilization**, in the order
+**scale/crop → horizontal flip → brightness/contrast**. Both RGB inputs always
+use the same geometric parameters; the current-frame mask follows the same
+geometry. Output size remains the chosen `--resize`, or native frame size if
+resize is omitted. Samples within a batch must still have equal sizes.
+
+| Enabled transform | Default probability | Effect on the two frames | Effect on current mask |
+| --- | --- | --- | --- |
+| `scale`: zoom out | 40% | Shrink by one shared factor in `[0.6, 1.0]`, paste at the same random position on the original-size canvas | Same shrink/position, background padding is 0 |
+| `scale`: zoom in | 10% | Enlarge by one shared factor in `[1.0, 1.2]`, crop the same random window back to the original size | Same enlargement and crop |
+| `scale`: unchanged | 50% | Keep original scale and field of view | Unchanged |
+| `hflip` | 50% | Flip both horizontally | Flip horizontally |
+| `brightness_contrast` | 50% | Shared brightness and contrast factors, each sampled independently from `[0.85, 1.15]` | Unchanged |
+
+The three scale branches are mutually exclusive; flip and photometric decisions
+are independent. Zoom-out padding uses one shared RGB color: the average of
+the two frames' per-channel means before augmentation. It does not reflect or
+repeat objects. Contrast is adjusted around 127.5, followed by multiplication
+by the brightness factor and clipping to `[0, 255]`. RGB resizing is bilinear;
+mask resizing uses nearest-neighbor and preserves binary labels.
+
+For example, scale `0.6` makes a 20-pixel-wide object approximately 12 pixels
+wide and its area approximately 36% of the original. Zoom-in makes objects
+larger but **cannot restore details already lost during input resizing**.
+Zoom-in probability must be lower than zoom-out probability whenever zoom-in
+is enabled, and their sum must be at most 1. Set `zoom_in_p=0` for zoom-out only;
+both probabilities may be zero. Invalid probabilities/ranges are rejected.
+
+**Small-object protection:** before scale/crop, label every foreground region
+with 8-connected components. Transform these IDs with the same nearest-neighbor
+operation as the target. If **any** region disappears completely, discard only
+scale/crop for both frames and the mask, without retrying. Flip and
+brightness/contrast may still run. A partially cropped region is accepted if
+at least one pixel remains. Empty masks can be augmented normally.
+
+This guard protects regions present **after the ordinary input resize**; it
+cannot recover regions that resize already removed or guarantee that a surviving
+one-pixel object is easy to recognize. Rejected transforms mean the actual
+accepted zoom rates may be below the configured sampling probabilities.
+
+Validation (including separate validation folders), fixed TensorBoard validation
+previews and inference use their existing preprocessing without augmentation.
+Sampling uses PyTorch's seeded RNG; augmentation sampling with the same seed
+and worker count is reproducible, and checkpoints preserve the RNG used by
+augmentation. This does not guarantee deterministic GPU model computation.
+
+Run the augmentation checks without starting a full training run:
+
+```bash
+python checks/check_frame_augmentation.py
+```
+
 ## Corrected CUSTOM loss and comparing improvements
 
 `CUSTOM` now uses **soft intersection** `sigmoid(logits) * target`, including
