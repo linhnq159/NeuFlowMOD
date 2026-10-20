@@ -257,12 +257,37 @@ Each run writes these files automatically, including with `--no-tensorboard`:
     session.json                  # config, command, runtime, resume source, samples
     config.json                   # effective config for this invocation
     summary.json                  # this session's status and best metadata
-    checkpoint/epoch_XXXXXX.pth    # retained only when a best metric improves
+    checkpoint/epoch_XXXXXX.pth    # retained on a new best OR every --save_freq epochs
   tensorboard/<session_id>/       # optional scalar/image event files
 ```
 
 All completed epochs are appended and flushed immediately. Progress bars stay
 in the console; `train.log` contains epoch summaries rather than batch output.
+In addition to `last.pth`, full checkpoints are retained at epochs **100, 200,
+300, ...** by default (`epoch % 100 == 0`), even when no validation metric
+improves or validation is skipped/disabled. For example, epoch 100 is kept at
+`sessions/<session_id>/checkpoint/epoch_000100.pth`. These checkpoints include
+model weights, optimizer, scheduler, scaler, RNG state and epoch metrics, and
+can be passed directly to `--resume`. Validation fields are null if that epoch
+did not run validation. The checkpoint path is also recorded in `train.log`.
+
+Use `--save_freq 50` to keep every 50th epoch, or `--save_freq 0` to disable
+periodic retention. This option applies to the current invocation, including
+resume; omitted means 100. Saving follows the absolute epoch number, not the
+number of epochs since resume. Each session has its own archive, so repeating
+an epoch after resuming an older checkpoint preserves the earlier session's
+copy. Periodic saving does not change the per-epoch log or `last.pth` frequency.
+
+Best-checkpoint selection uses validation metrics:
+
+| Checkpoint | Updated when |
+| --- | --- |
+| `best_iou.pth` | Global pixel IoU increases; primary segmentation checkpoint |
+| `best_nIoU.pth` | Mean per-image IoU over all validation images increases |
+| `best_PD.pth` | Object detection probability increases |
+| `best_FA.pth` | False alarm ratio decreases |
+| `last.pth` | Every epoch completes, regardless of validation |
+
 `summary.json` records `running`, `completed`, `interrupted` or `failed`, the last
 completed epoch, and each best value with its epoch and checkpoint path (paths
 are relative to the run). Startup failures are also logged. An interruption in

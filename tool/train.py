@@ -84,6 +84,8 @@ def parse_args(argv=None):
     parser.add_argument('--T', type=float, default=10, help='Distillation temperature')
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--eval_freq', type=int, default=1)
+    parser.add_argument('--save_freq', type=int, default=100,
+                        help='Keep a full checkpoint every N completed epochs, regardless of metrics; 0 disables')
     parser.add_argument('--gain', type=float, default=0.4,
                         help='Deprecated compatibility option; ignored by corrected CUSTOM loss')
     parser.add_argument('--clip_grad', type=float, default=0.0, help='Gradient norm limit; 0 disables clipping')
@@ -106,6 +108,8 @@ def parse_args(argv=None):
         parser.error('Require 1 <= start_epoch <= epochs.')
     if args.frame_skip < 1 or args.eval_freq < 1 or args.num_workers < 0:
         parser.error('frame_skip/eval_freq must be >= 1 and num_workers must be >= 0.')
+    if args.save_freq < 0:
+        parser.error('--save_freq must be >= 0 (0 disables periodic checkpoints).')
     if args.tb_image_freq < 1 or args.tb_num_images < 1:
         parser.error('tb_image_freq and tb_num_images must be positive integers.')
     if args.iters_s16 < 1 or args.iters_s8 < 1:
@@ -521,8 +525,15 @@ class Trainer:
         temporary_path.replace(path)
         destinations = {self.save_pth3 / f'{name}.pth' for name in improved}
         destinations.update(self.save_folder3 / self.best_checkpoints[name] for name in improved)
+        save_freq = getattr(self.args, 'save_freq', 100)
+        periodic_path = None
+        if save_freq > 0 and epoch % save_freq == 0:
+            periodic_path = self.history.session_dir / 'checkpoint' / f'epoch_{epoch:06d}.pth'
+            destinations.add(periodic_path)
         for destination in destinations:
             checkpoint_alias(path, destination)
+        if periodic_path is not None:
+            self.history.logger.info('Periodic checkpoint at epoch %s: %s', epoch, periodic_path)
         self.history.append(metrics, self._best_records())
         for name, value in metrics.items():
             if isinstance(value, (float, int)) and name != 'epoch':

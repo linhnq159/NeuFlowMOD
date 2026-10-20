@@ -10,7 +10,7 @@ import math
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -256,6 +256,62 @@ class TrainingLogChecks(unittest.TestCase):
         self.epoch(trainer, 2, validate=False)
         for name in (*VAL_FIELDS, 'val_samples', 'val_seconds'):
             self.assertIsNone(self.rows(trainer)[1][name], name)
+
+    def test_periodic_checkpoint_default_boundary_keeps_epoch_without_validation(self):
+        trainer = self.trainer('--epochs', '201', '--val_split', '0')
+        self.assertEqual(trainer.args.save_freq, 100)
+        self.epoch(trainer, 99, validate=False)
+        archive = trainer.history.session_dir / 'checkpoint'
+        self.assertFalse((archive / 'epoch_000099.pth').exists())
+        self.epoch(trainer, 100, validate=False)
+        periodic = archive / 'epoch_000100.pth'
+        saved_bytes = periodic.read_bytes()
+        saved = load_checkpoint(periodic)
+        self.assertEqual(saved['epoch'], 100)
+        self.assertIsNone(saved['epoch_metrics']['val_iou'])
+        for key in ('model', 'optimizer', 'lr_scheduler', 'scaler', 'rng_state'):
+            self.assertIn(key, saved)
+        self.epoch(trainer, 101, validate=False)
+        self.assertEqual(periodic.read_bytes(), saved_bytes)
+        self.assertFalse((archive / 'epoch_000101.pth').exists())
+        self.assertEqual(load_checkpoint(trainer.save_pth3 / 'last.pth')['epoch'], 101)
+        self.assertEqual([row['epoch'] for row in self.rows(trainer)], [99, 100, 101])
+        self.assertIn('Periodic checkpoint at epoch 100', (trainer.save_folder3 / 'train.log').read_text())
+        resumed = self.trainer('--epochs', '201', '--val_split', '0', '--resume', str(periodic))
+        self.assertEqual(resumed.args.start_epoch, 101)
+        self.assertEqual(resumed.save_folder3, trainer.save_folder3.resolve())
+        self.epoch(resumed, 200, validate=False)
+        self.assertTrue((resumed.history.session_dir / 'checkpoint' / 'epoch_000200.pth').is_file())
+        self.assertEqual(periodic.read_bytes(), saved_bytes)
+
+    def test_periodic_checkpoint_with_no_improvement_and_best_on_same_epoch(self):
+        trainer = self.trainer('--save_freq', '1')
+        self.epoch(trainer, 1)
+        archive = trainer.history.session_dir / 'checkpoint'
+        self.assertEqual(list(archive.glob('*.pth')), [archive / 'epoch_000001.pth'])
+        best_before = {name: (trainer.save_folder3 / path).read_bytes()
+                       for name, path in trainer.best_checkpoints.items() if path}
+        trainer.training(2)
+        # Restore the preceding model so validation repeats its metrics exactly.
+        trainer.model.load_state_dict(load_checkpoint(archive / 'epoch_000001.pth')['model'])
+        improved = trainer.validation(2)
+        self.assertEqual(improved, [])
+        trainer.save_checkpoint(2, improved)
+        self.assertTrue((archive / 'epoch_000002.pth').exists())
+        self.assertIsNotNone(load_checkpoint(archive / 'epoch_000002.pth')['epoch_metrics']['val_iou'])
+        for name, expected in best_before.items():
+            self.assertEqual((trainer.save_pth3 / f'{name}.pth').read_bytes(), expected)
+
+    def test_periodic_checkpoint_disabled_still_saves_best_and_logs(self):
+        trainer = self.trainer('--epochs', '101', '--save_freq', '0')
+        self.epoch(trainer, 1)
+        self.assertTrue((trainer.save_pth3 / 'best_iou.pth').is_file())
+        self.epoch(trainer, 100, validate=False)
+        self.assertFalse((trainer.history.session_dir / 'checkpoint' / 'epoch_000100.pth').exists())
+        self.assertEqual(load_checkpoint(trainer.save_pth3 / 'last.pth')['epoch'], 100)
+        self.assertEqual(len(self.rows(trainer)), 2)
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.args('--save_freq', '-1')
 
     def test_run_loop_no_validation_and_eval_frequency(self):
         for options, expected in [(('--val_split', '0'), [False, False]),
