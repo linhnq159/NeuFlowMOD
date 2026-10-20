@@ -609,6 +609,102 @@ to S16=1 and S8=8. Stabilization follows the checkpoint rules above. `--device`
 defaults to CUDA when available, otherwise CPU; `--no-amp` disables CUDA AMP.
 The script prints alignment success/fallback and the chosen model input size.
 
+## Video and image-sequence segmentation inference
+
+`tool/infer_video.py` processes a video or **one sequence folder** with the same
+RGB preprocessing, stabilization and model as `tool/infer.py`. It loads the
+checkpoint once and keeps a bounded buffer of past frames.
+
+```bash
+# Video: use checkpoint resize, frame_skip, head mode, iterations and precision.
+python tool/infer_video.py \
+  --checkpoint /path/to/run/checkpoint/best_iou.pth \
+  --input /data/example.mp4 \
+  --output results/example_overlay.mp4 \
+  --device cuda:0 \
+  --threshold 0.5
+
+# One folder of images; optional original-size binary masks and playback FPS.
+python tool/infer_video.py \
+  --checkpoint /path/to/run/checkpoint/best_iou.pth \
+  --input datasets/MOD_ONESHOT/images/35_10 \
+  --output results/35_10_overlay.mp4 \
+  --mask_dir results/35_10_masks \
+  --fps 30 \
+  --device cuda:0 \
+  --no-amp
+```
+
+Image filenames are sorted naturally (`frame_2` before `frame_10`); only images
+directly inside the selected folder are used. Select a single sequence, not
+the dataset root. For each frame at index `t`, the model receives `(t,
+t-frame_skip)`. Frame skip measures distance in decoded/sorted frames and does
+not drop frames from the output. The first `frame_skip` frames pass through
+without predictions or mask PNGs. Input must contain at least `frame_skip + 1`
+frames, all with equal original dimensions. Grayscale images are converted to
+RGB. Augmentation is not used.
+
+The following values come from checkpoint `args` unless explicitly overridden:
+
+| Setting | CLI override | Legacy fallback if metadata is absent |
+| --- | --- | --- |
+| Frame distance | `--frame_skip N` | 1 |
+| Model input size | `--resize WIDTH HEIGHT` / `--img_size` | 960×544; saved `null` keeps native size |
+| Head input | `--seg_input flow` / `flow_rgb` | `flow`; conflicting overrides are rejected |
+| Refinement iterations | `--iters_s16 N`, `--iters_s8 N` | 1 / 8 |
+| Alignment | `--stabilization none` / `homography` | `none` |
+| CUDA precision | `--amp` / `--no-amp` | FP32 |
+
+Unlike the older pair CLI's default, this video CLI **inherits the saved AMP
+setting**. A checkpoint trained with `--no-amp` therefore uses FP32 by default.
+CPU inference always uses FP32. The effective precision is printed and saved.
+For externally aligned inputs, explicitly use `--stabilization none`.
+
+Logits are resized back to the current frame's original dimensions with
+bilinear interpolation, followed by sigmoid and `--threshold` (default 0.5).
+The overlay blends foreground pixels with green; adjust its opacity with
+`--overlay_alpha` (default 0.45). `--mask_dir` writes single-channel PNGs containing
+0/255 named `frame_000003.png`, etc. Names use **zero-based source indices**;
+the timing CSV maps each index to its original filename and past frame.
+The first frames without a prediction have no mask file.
+
+Output `.mp4` uses `mp4v`, and `.avi` uses `MJPG`; `--codec FOURCC` can override
+this if supported by your OpenCV build. Video FPS is inherited from the source;
+image folders default to 30 FPS. `--fps` changes playback FPS without resampling
+frames. Output has no audio. Odd original widths/heights are padded by one
+pixel on the right/bottom for video encoding; mask PNGs retain exact original
+dimensions. `--max_frames 100` processes only the first 100 source frames for a
+quick check, including initial frames without predictions.
+
+Alongside `example_overlay.mp4`, the script automatically writes:
+
+- `example_overlay.stats.json`: effective config, checkpoint epoch, original
+  and encoded sizes, frames/predictions, alignment success/fallback counts,
+  setup time, processing time, pipeline FPS and mean model-forward latency.
+- `example_overlay.timings.csv`: each frame's source/past identity, foreground
+  pixel count, alignment result and decode/preprocess/transfer/forward/
+  postprocess/write timings. Initial frames have blank prediction metadata.
+
+Pipeline FPS includes reading, stabilization, prediction, overlay/optional PNG
+generation and output encoding/finalization; model setup is reported separately.
+The first prediction is included, so startup allocations can make short clips
+slower. CUDA timings explicitly synchronize the selected device. Reported FPS
+describes this sequential pipeline, not an asynchronous deployment benchmark;
+playback FPS is separate. `predictions_per_second` also accounts for initial
+frames that have no prediction.
+
+CSV rows are flushed as frames finish. On processing errors or Ctrl+C, video
+resources are released and the JSON reports `failed` or `interrupted` with
+partial output counts. Early EOF relative to the video's reported frame count
+is marked `incomplete`; OpenCV may not distinguish a decode error from EOF.
+Existing overlay and report files at the chosen output paths are replaced, so
+use separate output names to retain multiple runs. `--mask_dir` must be a new
+or empty directory to avoid leaving stale masks from a preceding run.
+
+```bash
+python checks/check_infer_video.py
+```
+
 ## Inference with a different number of iterations
 
 `--iters_s16` and `--iters_s8` must be positive integers. They control training
