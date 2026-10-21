@@ -34,6 +34,17 @@ HISTORY_FIELDS = (
 )
 
 
+DETECTION_BEST_NAMES = ('best_map', 'best_map50')
+DETECTION_VAL_FIELDS = ('val_loss', 'val_loss_center', 'val_loss_size', 'val_loss_offset',
+                        'val_map', 'val_map50', 'val_precision', 'val_recall', 'val_boxes',
+                        'val_collisions', 'val_empty_samples', 'val_empty_false_positives', 'val_empty_fp_per_image')
+DETECTION_HISTORY_FIELDS = (
+    'session_id', 'epoch', 'loss_version', 'train_loss_total', 'train_loss_center',
+    'train_loss_size', 'train_loss_offset', 'train_boxes', 'train_collisions', 'train_samples',
+    *DETECTION_VAL_FIELDS, 'val_samples', *HISTORY_FIELDS[HISTORY_FIELDS.index('lr_head'):],
+)
+
+
 def json_values(value):
     """Use plain metadata types, also loadable with weights_only on PyTorch 2.3."""
     if isinstance(value, dict):
@@ -119,6 +130,8 @@ class SegmentationStats:
 class RunHistory:
     def __init__(self, folder, args):
         self.folder = Path(folder)
+        detection = getattr(args, "task", "segmentation") == "detection"
+        self.fields = DETECTION_HISTORY_FIELDS if detection else HISTORY_FIELDS
         self.session_id = datetime.now().strftime('%Y%m%dT%H%M%S%f') + '-' + uuid.uuid4().hex[:8]
         self.session_dir = self.folder / 'sessions' / self.session_id
         self.session_dir.mkdir(parents=True)
@@ -137,7 +150,7 @@ class RunHistory:
         )
         write_json(self.session_dir / 'session.json', self.snapshot)
         self.summary = dict(status='initializing', session_id=self.session_id,
-                            last_completed_epoch=None, best={}, primary_checkpoint='checkpoint/best_iou.pth')
+                            last_completed_epoch=None, best={}, primary_checkpoint='checkpoint/best_map.pth' if detection else 'checkpoint/best_iou.pth')
         self._write_summary()
         self.logger.info('Session %s; command: %s', self.session_id, self.snapshot['command'])
         self.logger.info('Runtime: Python %s; PyTorch %s; CUDA %s',
@@ -169,7 +182,7 @@ class RunHistory:
         self._write_summary()
 
     def append(self, metrics, best):
-        row = {name: json_values(metrics.get(name)) for name in HISTORY_FIELDS}
+        row = {name: json_values(metrics.get(name)) for name in self.fields}
         with (self.folder / 'history.jsonl').open('a') as stream:
             stream.write(json.dumps(row, allow_nan=False) + '\n')
             stream.flush()
@@ -177,7 +190,7 @@ class RunHistory:
         path = self.folder / 'history.csv'
         needs_header = not path.exists() or path.stat().st_size == 0
         with path.open('a', newline='') as stream:
-            writer = csv.DictWriter(stream, fieldnames=HISTORY_FIELDS)
+            writer = csv.DictWriter(stream, fieldnames=self.fields)
             if needs_header:
                 writer.writeheader()
             writer.writerow(row)
@@ -202,10 +215,13 @@ class RunHistory:
 
 
 def sample_identity(dataset, index):
-    current, past, mask = dataset.samples[index]
-    return dict(current=str(current.relative_to(dataset.image_dir)),
-                past=str(past.relative_to(dataset.image_dir)),
-                mask=str(mask.relative_to(dataset.mask_dir)))
+    current, past, annotation = dataset.samples[index]
+    identity = dict(current=str(current.relative_to(dataset.image_dir)), past=str(past.relative_to(dataset.image_dir)))
+    if hasattr(dataset, 'label_dir'):
+        identity['label'] = str(annotation.relative_to(dataset.label_dir))
+    else:
+        identity['mask'] = str(annotation.relative_to(dataset.mask_dir))
+    return identity
 
 
 def select_preview_samples(dataset, count, saved=()):
@@ -217,7 +233,7 @@ def select_preview_samples(dataset, count, saved=()):
     if dataset is None:
         return [], []
     identities = [sample_identity(dataset, index) for index in range(len(dataset))]
-    key = lambda item: (item['current'], item['past'], item['mask'])
+    key = lambda item: (item['current'], item['past'], item.get('mask', item.get('label')))
     lookup = {key(identity): index for index, identity in enumerate(identities)}
     selected = list(dict.fromkeys(lookup[key(item)] for item in saved if key(item) in lookup))[:count]
     if len(selected) == min(count, len(dataset)):
@@ -231,16 +247,19 @@ def select_preview_samples(dataset, count, saved=()):
     for indices in groups.values():
         found = Counter()
         for index in indices:
-            with Image.open(dataset.samples[index][2]) as image:
-                values = np.array(image)
-                mask = np.any(values[..., :3] > 0, axis=-1) if values.ndim == 3 else values > 0
-                if dataset.img_size is None:
-                    with Image.open(dataset.samples[index][0]) as current:
-                        size = current.size
-                else:
-                    size = dataset.img_size
-                mask = Image.fromarray(mask.astype(np.uint8)).resize(size, Image.Resampling.NEAREST)
-                positive = bool(np.asarray(mask).any())
+            if hasattr(dataset, 'annotations'):
+                positive = bool(len(dataset.annotations[index]))
+            else:
+                with Image.open(dataset.samples[index][2]) as image:
+                    values = np.array(image)
+                    mask = np.any(values[..., :3] > 0, axis=-1) if values.ndim == 3 else values > 0
+                    if dataset.img_size is None:
+                        with Image.open(dataset.samples[index][0]) as current:
+                            size = current.size
+                    else:
+                        size = dataset.img_size
+                    mask = Image.fromarray(mask.astype(np.uint8)).resize(size, Image.Resampling.NEAREST)
+                    positive = bool(np.asarray(mask).any())
             if found[positive] < count:
                 candidates[positive].append(index)
                 found[positive] += 1

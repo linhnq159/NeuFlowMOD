@@ -1,4 +1,4 @@
-"""Train frame-pair motion segmentation from images and current-frame masks."""
+"""Train frame-pair motion segmentation (masks) or detection (YOLO TXT boxes)."""
 
 import json
 import math
@@ -20,11 +20,14 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from data_utils.frame_mask_dataset import FrameMaskDataset, collate_frame_masks
+from data_utils.frame_box_dataset import FrameBoxDataset, collate_frame_boxes
 from data_utils.frame_pair import init_frame_worker
 from data_utils.frame_augmentation import AUGMENT_MODES
 from tool.checkpoints import (load_checkpoint, load_weights, load_model_weights,
                               resolve_stabilization, resolve_seg_input, resolve_train_augmentation,
-                              transfer_model_weights)
+                              transfer_model_weights, resolve_task, checkpoint_args)
+from tool.detection import (add_detection_arguments, resolve_detection_options, DetectionLoss,
+                            DETECTION_LOSS_VERSION, DETECTION_CONFIG)
 from NeuFlow.config import SEG_INPUT_MODES
 from NeuFlow.model_builder import ModelBuilder
 from external.ILNet.utils.Adan import Adan
@@ -35,14 +38,16 @@ from external.ILNet.model.metrics import PD_FA
 from external.ILNet.loss.custom_loss import CustomLoss, CUSTOM_LOSS_VERSION
 from tool.training_log import (BEST_NAMES, VAL_FIELDS, RunHistory, SegmentationStats,
                                checkpoint_alias, json_values, preview_panel, select_preview_samples)
+from tool.training_log import DETECTION_BEST_NAMES, DETECTION_VAL_FIELDS
 
 
 def parse_args(argv=None):
     parser = ArgumentParser(description=__doc__)
+    add_detection_arguments(parser)
     parser.add_argument('--work_dir', default='work_seg/checkpoint')
     parser.add_argument('--resize', '--img_size', dest='img_size', nargs=2, type=int,
                         metavar=('WIDTH', 'HEIGHT'),
-                        help='Resize frames and masks; omitted: keep frames native and resize masks to match')
+                        help='Resize both frames and labels; omitted: native frames, masks match frames, boxes use frame coordinates')
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--epochs', type=int, default=600)
@@ -52,15 +57,17 @@ def parse_args(argv=None):
     parser.add_argument('--lr_sch', choices=['ilnet', 'cos'], default='ilnet')
     parser.add_argument('--seg_input', choices=SEG_INPUT_MODES, default=None,
                         help='Head input; new runs use NeuFlow/config.py, resume uses checkpoint')
-    parser.add_argument('--data_path', help='Dataset root with images/ and masks/')
+    parser.add_argument('--data_path', help='Dataset root with images/ and masks/ (segmentation) or labels/ (detection)')
     parser.add_argument('--image_dir', '--train_image_dir', dest='image_dir', help='Training image folder')
     parser.add_argument('--mask_dir', '--train_mask_dir', dest='mask_dir', help='Training ground-truth mask folder')
     parser.add_argument('--val_image_dir', help='Optional separate validation image folder')
     parser.add_argument('--val_mask_dir', help='Optional separate validation mask folder')
+    parser.add_argument('--label_dir', help='Training YOLO TXT folder; detection only')
+    parser.add_argument('--val_label_dir', help='Separate validation YOLO TXT folder')
     parser.add_argument('--val_split', type=float, default=0.2,
                         help='Last fraction of each sequence reserved for validation; 0 disables it')
     parser.add_argument('--frame_skip', type=int, default=1,
-                        help='Distance in sorted frames: inputs (t, t-frame_skip), target mask at t')
+                        help='Distance in sorted frames: inputs (t, t-frame_skip), target annotation at t')
     parser.add_argument('--iters_s16', type=int, default=1, help='Number of S16 refinement iterations')
     parser.add_argument('--iters_s8', type=int, default=8, help='Number of S8 refinement iterations')
     parser.add_argument('--stabilization', choices=['none', 'homography'], default=None,
@@ -68,7 +75,7 @@ def parse_args(argv=None):
     parser.add_argument('--augment', nargs='+', choices=('none',) + AUGMENT_MODES, default=None,
                         help='Training augmentations; defaults from config or resume checkpoint. Use none to disable')
     parser.add_argument('--mode', default='L')
-    parser.add_argument('--loss', type=str.upper, default='CUSTOM',
+    parser.add_argument('--loss', type=str.upper, default=None,
                         choices=['BCE', 'SOFTIOULOSS', 'DICE', 'FOCAL', 'CUSTOM', 'ASIMMUNIFOCAL', 'NAF'])
     parser.add_argument('--resume', default='', help='Resume model, optimizer, scheduler and epoch')
     parser.add_argument('--transfer', default='', help='Initialize model weights from a checkpoint')
@@ -79,7 +86,7 @@ def parse_args(argv=None):
                         help='Preview images at first validation, every N epochs, and new best IoU')
     parser.add_argument('--tb_num_images', type=int, default=4,
                         help='Number of fixed validation previews (prefer 3 foreground / 1 empty)')
-    parser.add_argument('--teacher', default='', help='Optional ModelBuilder checkpoint for distillation')
+    parser.add_argument('--teacher', default='', help='Optional segmentation checkpoint for distillation; segmentation only')
     parser.add_argument('--alpha', type=float, default=0.5, help='Supervised loss weight when using a teacher')
     parser.add_argument('--T', type=float, default=10, help='Distillation temperature')
     parser.add_argument('--device', default='cuda:0')
@@ -102,6 +109,19 @@ def parse_args(argv=None):
         parser.error('--augment requires unique choices; none cannot be combined with other modes.')
     if args.resume and args.transfer:
         parser.error('Choose either --resume or --transfer, not both.')
+    checkpoint = load_checkpoint(args.resume) if args.resume else None
+    try:
+        args.task = resolve_task(args.task, checkpoint)
+        resolve_detection_options(args, checkpoint_args(checkpoint))
+    except ValueError as error:
+        parser.error(str(error))
+    if args.task == 'detection':
+        if args.loss is not None or args.teacher:
+            parser.error('Detection uses centernet_v1; --loss and segmentation --teacher are not supported.')
+        args.loss = 'CENTERNET'
+        args.detection_config = dict(DETECTION_CONFIG)
+    else:
+        args.loss = args.loss or 'CUSTOM'
     if args.batch_size < 2:
         parser.error('--batch_size must be >= 2 because the head has BatchNorm after global pooling.')
     if args.epochs < 1 or args.start_epoch < 1 or args.start_epoch > args.epochs:
@@ -124,34 +144,39 @@ def parse_args(argv=None):
         parser.error('Require 0 <= val_split < 1, 0 <= alpha <= 1, and T > 0.')
     if args.img_size is not None and min(args.img_size) < 32:
         parser.error('--resize WIDTH HEIGHT must be >= 32.')
-    if bool(args.val_image_dir) != bool(args.val_mask_dir):
-        parser.error('Provide both --val_image_dir and --val_mask_dir.')
+    label_arg = 'label_dir' if args.task == 'detection' else 'mask_dir'
+    if bool(args.val_image_dir) != bool(getattr(args, 'val_' + label_arg)):
+        parser.error(f'Provide both --val_image_dir and --val_{label_arg}.')
     if args.data_path:
         args.image_dir = args.image_dir or str(Path(args.data_path) / 'images')
-        args.mask_dir = args.mask_dir or str(Path(args.data_path) / 'masks')
-    if not args.image_dir or not args.mask_dir:
-        parser.error('Provide --image_dir and --mask_dir, or --data_path with images/ and masks/.')
+        setattr(args, label_arg, getattr(args, label_arg) or str(Path(args.data_path) / ('labels' if args.task == 'detection' else 'masks')))
+    if not args.image_dir or not getattr(args, label_arg):
+        parser.error(f'Provide --image_dir and --{label_arg}, or --data_path.')
     return args
 
 
 def build_datasets(args):
     checkpoint = load_checkpoint(args.resume) if args.resume else None
     args.seg_input = resolve_seg_input(args.seg_input, checkpoint)
+    args.task = resolve_task(getattr(args, 'task', None), checkpoint)
     if args.stabilization is None:
         args.stabilization = resolve_stabilization(None, checkpoint)
     args.train_augmentation = resolve_train_augmentation(getattr(args, 'augment', None), checkpoint)
     options = dict(img_size=args.img_size, frame_skip=args.frame_skip, stabilization=args.stabilization)
+    dataset_class = FrameBoxDataset if args.task == 'detection' else FrameMaskDataset
+    label_dir = args.label_dir if args.task == 'detection' else args.mask_dir
+    val_label_dir = args.val_label_dir if args.task == 'detection' else args.val_mask_dir
     if args.val_image_dir:
-        train_set = FrameMaskDataset(args.image_dir, args.mask_dir, augmentation=args.train_augmentation, **options)
-        val_set = FrameMaskDataset(args.val_image_dir, args.val_mask_dir, **options)
+        train_set = dataset_class(args.image_dir, label_dir, augmentation=args.train_augmentation, **options)
+        val_set = dataset_class(args.val_image_dir, val_label_dir, **options)
         train_frames = {path.resolve() for sample in train_set.samples for path in sample[:2]}
         val_frames = {path.resolve() for sample in val_set.samples for path in sample[:2]}
         if train_frames & val_frames:
             raise ValueError('Training and validation folders contain the same frame paths.')
     else:
-        train_set = FrameMaskDataset(args.image_dir, args.mask_dir, split='train',
+        train_set = dataset_class(args.image_dir, label_dir, split='train',
                                     val_split=args.val_split, augmentation=args.train_augmentation, **options)
-        val_set = (FrameMaskDataset(args.image_dir, args.mask_dir, split='val',
+        val_set = (dataset_class(args.image_dir, label_dir, split='val',
                                    val_split=args.val_split, **options) if args.val_split else None)
     return train_set, val_set
 
@@ -159,7 +184,12 @@ def build_datasets(args):
 class Trainer:
     def __init__(self, args):
         self.args = args
-        args.loss_version = CUSTOM_LOSS_VERSION if args.loss == 'CUSTOM' else f'{args.loss.lower()}_v1'
+        args.task = resolve_task(getattr(args, 'task', None), load_checkpoint(args.resume) if args.resume else None)
+        self.detection = args.task == 'detection'
+        self.best_names = DETECTION_BEST_NAMES if self.detection else BEST_NAMES
+        self.val_fields = DETECTION_VAL_FIELDS if self.detection else VAL_FIELDS
+        args.loss_version = (DETECTION_LOSS_VERSION if self.detection else
+                             CUSTOM_LOSS_VERSION if args.loss == 'CUSTOM' else f'{args.loss.lower()}_v1')
         if args.resume:
             self.save_pth3 = Path(args.resume).resolve().parent
             self.save_folder3 = self.save_pth3.parent
@@ -185,19 +215,19 @@ class Trainer:
         if len(self.train_set) < 2:
             raise ValueError('Training needs at least two frame pairs for the head BatchNorm.')
         loader_args = dict(num_workers=args.num_workers, pin_memory=self.device.type == 'cuda',
-                           worker_init_fn=init_frame_worker, collate_fn=collate_frame_masks)
+                           worker_init_fn=init_frame_worker, collate_fn=collate_frame_boxes if self.detection else collate_frame_masks)
         batch_size = min(args.batch_size, len(self.train_set))
         # Global-pooling BatchNorm cannot train on a final batch of one sample.
         self.train_data_loader = DataLoader(self.train_set, batch_size=batch_size, shuffle=True,
                                             drop_last=True, **loader_args)
         self.val_data_loader = (DataLoader(self.val_set, batch_size=args.batch_size, **loader_args)
                                 if self.val_set is not None else None)
-        print(f'Train: {len(self.train_set)} pairs; validation: {len(self.val_set) if self.val_set is not None else 0}; '
+        print(f'Task: {args.task}; Train: {len(self.train_set)} pairs; validation: {len(self.val_set) if self.val_set is not None else 0}; '
               f'batch size: {batch_size}; frame_skip: {args.frame_skip}; '
               f'iterations S16/S8: {args.iters_s16}/{args.iters_s8}; stabilization: {args.stabilization}; '
               f'seg_input: {args.seg_input}; resize: {args.img_size or "native (masks match frames)"}')
         print(f'Train augmentation: {json.dumps(args.train_augmentation, sort_keys=True)}')
-        self.model = ModelBuilder(seg_input=args.seg_input).to(self.device)
+        self.model = ModelBuilder(seg_input=args.seg_input, task=args.task).to(self.device)
         if not args.resume:
             if args.transfer:
                 transfer_model_weights(self.model, load_checkpoint(args.transfer))
@@ -213,10 +243,11 @@ class Trainer:
         self.scaler = torch.amp.GradScaler('cuda', enabled=args.amp and self.device.type == 'cuda')
         self.optimizer, self.lr_scheduler = self.build_opt_lr(self.model)
         self.criterion = self.build_loss()
-        self.PD_FA = PD_FA(args.img_size)
+        self.PD_FA = None if self.detection else PD_FA(args.img_size)
         self.best_iou, self.best_nIoU, self.best_PD, self.best_FA = -1.0, -1.0, -1.0, float('inf')
-        self.best_epochs = {name: None for name in BEST_NAMES}
-        self.best_checkpoints = {name: None for name in BEST_NAMES}
+        self.best_map = self.best_map50 = -1.0
+        self.best_epochs = {name: None for name in self.best_names}
+        self.best_checkpoints = {name: None for name in self.best_names}
         if args.resume:
             self.model.load_state_dict(checkpoint['model'])
             self.optimizer.load_state_dict(checkpoint['optimizer'])
@@ -224,7 +255,7 @@ class Trainer:
             args.start_epoch = checkpoint['epoch'] + 1
             if checkpoint.get('scaler'):
                 self.scaler.load_state_dict(checkpoint['scaler'])
-            for key in ('best_iou', 'best_nIoU', 'best_PD', 'best_FA'):
+            for key in self.best_names:
                 if key in checkpoint:
                     setattr(self, key, checkpoint[key])
             self.best_epochs.update(checkpoint.get('best_epochs', {}))
@@ -266,11 +297,11 @@ class Trainer:
         return {name: dict(value=json_values(getattr(self, name)) if
                            (math.isfinite(getattr(self, name)) and getattr(self, name) >= 0) else None,
                            epoch=self.best_epochs[name], checkpoint=self.best_checkpoints[name])
-                for name in BEST_NAMES}
+                for name in self.best_names}
 
     def _restore_best_files(self, checkpoint):
         """Keep a rewind's best files consistent, while retaining old session weights."""
-        for name in BEST_NAMES:
+        for name in self.best_names:
             archived = self.best_checkpoints[name]
             if archived and (self.save_folder3 / archived).is_file():
                 checkpoint_alias(self.save_folder3 / archived, self.save_pth3 / f'{name}.pth')
@@ -289,6 +320,8 @@ class Trainer:
             self.best_checkpoints[name] = None
 
     def build_loss(self):
+        if getattr(self, 'detection', False):
+            return DetectionLoss()
         loss = self.args.loss
         if loss == 'CUSTOM':
             return CustomLoss()
@@ -311,8 +344,11 @@ class Trainer:
 
     def build_opt_lr(self, model):
         args = self.args
+        head_params = list(model.seg_head.parameters())
+        if getattr(model, 'task', 'segmentation') == 'detection':
+            head_params = list(model.seg_head.detection_feature_parameters()) + list(model.detection_head.parameters())
         params = [
-            {'params': model.seg_head.parameters(), 'lr': args.learning_rate},
+            {'params': head_params, 'lr': args.learning_rate},
             {'params': model.backbone_op.parameters(), 'lr': args.learning_rate * args.backbone_layer_lr},
         ]
         optimizer_type = {'adan': Adan, 'msam': AdamW_MSAM}[args.optim]
@@ -362,6 +398,9 @@ class Trainer:
             self.writer.add_scalar(name, value, epoch)
 
     def training(self, epoch):
+        if getattr(self, 'detection', False):
+            from tool.detection_training import train_detection
+            return train_detection(self, epoch)
         started = time.perf_counter()
         if self.device.type == 'cuda':
             torch.cuda.reset_peak_memory_stats(self.device)
@@ -444,6 +483,9 @@ class Trainer:
 
     @torch.no_grad()
     def validation(self, epoch):
+        if getattr(self, 'detection', False):
+            from tool.detection_training import validate_detection
+            return validate_detection(self, epoch)
         started = time.perf_counter()
         self.model.eval()
         self.PD_FA.reset()
@@ -498,7 +540,7 @@ class Trainer:
 
     def save_checkpoint(self, epoch, improved=()):
         metrics = dict(session_id=self.session_id, epoch=epoch, loss_version=self.args.loss_version,
-                       **{name: None for name in VAL_FIELDS}, val_samples=None, val_seconds=None)
+                       **{name: None for name in getattr(self, 'val_fields', VAL_FIELDS)}, val_samples=None, val_seconds=None)
         if self.train_epoch_stats and self.train_epoch_stats['epoch'] == epoch:
             metrics.update(self.train_epoch_stats)
         if self.val_epoch_stats and self.val_epoch_stats['epoch'] == epoch:
@@ -512,8 +554,7 @@ class Trainer:
         checkpoint = dict(model=self.model.state_dict(), optimizer=self.optimizer.state_dict(),
                           lr_scheduler=self.lr_scheduler.state_dict(), scaler=self.scaler.state_dict(),
                           epoch=epoch, args=json_values(vars(self.args)), rng_state=torch.get_rng_state(),
-                          best_iou=self.best_iou, best_nIoU=self.best_nIoU,
-                          best_PD=self.best_PD, best_FA=self.best_FA,
+                          **{name: getattr(self, name) for name in self.best_names},
                           loss_version=self.args.loss_version, session_id=self.session_id,
                           epoch_metrics=json_values(metrics), best_epochs=dict(self.best_epochs),
                           best_checkpoints=dict(self.best_checkpoints), tb_image_samples=self.tb_image_samples)
@@ -579,7 +620,9 @@ def run_training(args):
         if hasattr(trainer, 'history'):
             trainer.close()
     print(f'Last checkpoint: {trainer.save_pth3 / "last.pth"}')
-    if trainer.best_iou >= 0:
+    if trainer.detection and trainer.best_map >= 0:
+        print(f'Best AP50:95: {trainer.best_map:.5f}; best AP50: {trainer.best_map50:.5f}')
+    elif trainer.best_iou >= 0:
         print(f'Best IoU: {trainer.best_iou:.5f}; best nIoU: {trainer.best_nIoU:.5f}')
     return trainer
 

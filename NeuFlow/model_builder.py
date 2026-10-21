@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 from NeuFlow.neuflow import NeuFlow
 from NeuFlow import config
+from NeuFlow.detection_head import DetectionHead
 from external.ILNet.model.LW_Opticalflow import LW_OpticalFLow
 import torchvision.transforms as transforms
 
@@ -21,8 +22,11 @@ import torchvision.transforms as transforms
 class ModelBuilder(nn.Module):
     """Fine-tune NeuFlow through mask segmentation loss; flow labels are not required."""
 
-    def __init__(self, seg_input=None):
+    def __init__(self, seg_input=None, task='segmentation'):
         super(ModelBuilder, self).__init__()
+        if task not in ('segmentation', 'detection'):
+            raise ValueError(f'Unsupported task: {task}')
+        self.task = task
         self.seg_input = config.validate_seg_input(config.seg_input if seg_input is None else seg_input)
 
         # build backbone
@@ -35,6 +39,11 @@ class ModelBuilder(nn.Module):
 
         # build segment Unet head
         self.seg_head = LW_OpticalFLow(in_channels=5 if self.seg_input == 'flow_rgb' else 2)
+        if task == 'detection':
+            self.seg_head.requires_grad_(False)
+            for parameter in self.seg_head.detection_feature_parameters():
+                parameter.requires_grad_(True)
+            self.detection_head = DetectionHead()
         self._flow_init_key = None
 
         self.flow_normalize_seg = transforms.Normalize(
@@ -144,6 +153,10 @@ class ModelBuilder(nn.Module):
         if self.seg_input == 'flow_rgb':
             rgb = img0.to(dtype=head_input.dtype) / 255.0
             head_input = torch.cat((head_input, rgb), dim=1)
+        if self.task == 'detection':
+            outputs = self.detection_head(self.seg_head(head_input, features_only=True))
+            return {name: value[..., :(original_height + 3) // 4, :(original_width + 3) // 4]
+                    for name, value in outputs.items()}
         output_seg = self.seg_head(head_input)
         if pad_height or pad_width:
             if isinstance(output_seg, (list, tuple)):

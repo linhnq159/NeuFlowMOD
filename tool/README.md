@@ -1,4 +1,152 @@
-# Training from image and mask folders
+# Training and inference: segmentation or detection
+
+## Detection: YOLO TXT, one class, no masks required
+
+Use `--task segmentation` for the existing mask model or `--task detection` for
+the learned bounding-box head. New runs default to segmentation. Resume,
+inference and export use the checkpoint task automatically; an explicit task
+that conflicts with the checkpoint is rejected. Older checkpoints are
+segmentation checkpoints. Choosing detection is an architecture change and
+requires training the new head, rather than changing an inference flag on a
+segmentation checkpoint.
+
+The detection layout is:
+
+```text
+datasets/MOD_DET/
+  images/sequence_01/frame_000001.png
+  images/sequence_01/frame_000002.png
+  labels/sequence_01/frame_000002.txt
+```
+
+Each nonempty TXT line is standard YOLO `0 cx cy width height`, with center and
+size normalized to the **original current frame**. Class must be `0`; boxes
+must have positive size and lie inside the image. Multiple lines label multiple
+objects. An **empty TXT means an annotated frame with no target objects**; a
+missing TXT means unlabelled, so that frame is not a training target. It can
+still be used as a past frame. Label all target objects in an annotated current
+frame, including small ones; unlabelled objects in that frame become negatives.
+For MOD, class 0 denotes the moving foreground objects of interest.
+
+As with segmentation, each image subfolder is a sequence. Train/validation are
+split temporally inside each sequence **before** building current/past pairs.
+`frame_skip` counts sorted images, including frames without labels. Separate
+folders use `--image_dir`, `--label_dir`, `--val_image_dir`, `--val_label_dir`.
+Do not duplicate the same frames into train and validation under different names.
+
+```bash
+# New bbox run. Resize is WIDTH HEIGHT; all examples run from the repo root.
+python tool/train.py \
+  --task detection \
+  --data_path datasets/MOD_DET \
+  --resize 960 544 \
+  --seg_input flow_rgb \
+  --frame_skip 3 \
+  --val_split 0.2 \
+  --batch_size 4 \
+  --num_workers 6 \
+  --augment hflip brightness_contrast scale \
+  --device cuda:0 \
+  --no-amp
+
+# Initialize shared weights from a segmentation checkpoint, train a NEW bbox head.
+# Keep seg_input compatible with the source; flow -> flow_rgb is also supported.
+python tool/train.py \
+  --task detection \
+  --data_path datasets/MOD_DET \
+  --resize 960 544 \
+  --seg_input flow_rgb \
+  --frame_skip 3 \
+  --transfer work_seg/checkpoint/L_CUSTOM_2026-10-21-08-52-25-635181/checkpoint/best_iou.pth \
+  --learning_rate 0.0001 \
+  --epochs 30 --warm_up_epochs 3 \
+  --augment hflip brightness_contrast scale \
+  --device cuda:0 --no-amp
+```
+
+Detection uses the existing 32-channel decoder feature at stride 4 (240×136 for
+960×544 input), followed by a 3×3 Conv/ReLU and three 1×1 branches: center logits,
+positive box size (softplus), and sub-cell offset (sigmoid). It skips the later
+mask decoder and excludes unused segmentation parameters from the optimizer.
+Backbone freeze/unfreeze and head/backbone LR options work as before. The default
+unfreeze epoch remains 300; a 30-epoch run therefore keeps NeuFlow frozen.
+
+`centernet_v1` loss is `center_focal + 0.1 * size_L1 + offset_L1`. Regression
+uses assigned centers only; empty images train the center background. Gaussian
+heatmaps use minimum overlap 0.7, and losses are normalized per image by the
+number of assigned centers, then averaged across the batch. Two boxes whose
+centers fall in the same feature cell share one heatmap peak: the smaller box
+supplies regression targets and the collision count is logged. Validation still
+counts both ground-truth boxes. Detection does not compute mask loss and rejects
+explicit `--loss` or the segmentation `--teacher` option.
+
+Resize/flip/scale/crop transform both frames and boxes together. Crop clips boxes
+to the image; if any box disappears completely, only scale/crop is cancelled.
+Brightness/contrast leaves coordinates unchanged. Labels use continuous box
+coordinates, so this protection does not guarantee that a tiny object retains
+visible RGB detail. Validation is not augmented. Omitting `--resize` preserves
+image size; mixed image sizes within one batch require an explicit resize.
+
+Detection writes the same session histories, runtime statistics, `last.pth` and
+periodic snapshots as segmentation. It records center/size/offset loss, box and
+collision counts; mask metrics are absent. Validation reports single-class,
+all-area AP50 and AP50:95 with 101 recall points and one-to-one score-ordered
+matching, using score floor 0.001. These are bbox metrics, not mask IoU/Pd/Fa.
+There are no crowd/ignore annotations in YOLO TXT. Precision/recall at IoU 0.5
+and empty-frame false positives use `--conf_threshold` (default 0.25).
+An all-empty validation set has undefined AP/recall (`null`) and does not create
+a best-AP checkpoint. **`best_map.pth` uses AP50:95**, `best_map50.pth` uses AP50;
+use `last.pth` for resume. TensorBoard previews current frame / green GT boxes /
+red predictions with scores, retaining fixed samples across resume.
+
+```bash
+# Resume detection (task is inherited). Use the same dataset/resize settings.
+python tool/train.py \
+  --resume /path/to/detection_run/checkpoint/last.pth \
+  --data_path datasets/MOD_DET --resize 960 544 --frame_skip 3 \
+  --device cuda:0 --no-amp
+
+# Pair inference: annotated PNG plus results/detection.json, in original coordinates.
+python tool/infer.py \
+  --task detection --checkpoint /path/to/detection_run/checkpoint/best_map.pth \
+  --current /path/to/current.png --past /path/to/past.png \
+  --output results/detection.png \
+  --conf_threshold 0.25 --nms_iou 0.5 --max_detections 100 \
+  --device cuda:0 --no-amp
+
+# Video or one sequence folder: boxes/scores, timing CSV and stats JSON.
+python tool/infer_video.py \
+  --checkpoint /path/to/detection_run/checkpoint/best_map.pth \
+  --input /path/to/video.mp4 --output results/detection.mp4 \
+  --conf_threshold 0.25 --device cuda:0 --no-amp
+
+# Static ONNX for TensorRT; requirements: tool/requirements-export.txt.
+python tool/export_seg.py \
+  --task detection --checkpoint /path/to/detection_run/checkpoint/best_map.pth \
+  --img_size 960 544 --output results/detection.onnx
+```
+
+Decoding uses 3×3 local center maxima, top-K (`--max_detections`, default 100),
+confidence filtering and NMS (`--nms_iou`, default 0.5). `--threshold` remains the
+segmentation mask threshold; bbox inference uses **`--conf_threshold`**. Detection
+always draws learned boxes; `--draw_boxes`/`--min_contour_area` are segmentation
+contour options and `--mask_dir` is segmentation-only. Pair JSON contains
+`bbox_xyxy`, `score`, `class_id`; xyxy is continuous with exclusive right/bottom
+coordinates. Video CSV stores `boxes_xywh` and parallel `box_scores` lists;
+`foreground_pixels` is blank. Initial frames without a past pair have no
+predictions. Saved images/video retain original resolution (with existing
+one-pixel video encoder padding for odd dimensions).
+
+The detection ONNX graph exports `center_logits`, `size`, `offset`, each in
+FP32; sizes/offsets are in stride-four feature units. Decode/NMS and stabilization
+are outside the graph. Export checks all tensors and decoded boxes against
+PyTorch. The existing Flow/Flow+RGB TensorRT comparison benchmark also accepts
+`--task detection`; its source checkpoint must be **flow-only** as before. Its
+GPU runner transfers and validates all three outputs. This comparison uses
+synthetic validation pairs and initialized RGB channels for latency comparison,
+not a detector quality assessment. Measure end-to-end timing on the target
+device, including preprocessing and decode; 960×544 alone does not guarantee
+realtime. Existing segmentation export and benchmark commands remain supported.
 
 ## Quick start: MOD_ONESHOT
 

@@ -23,6 +23,16 @@ def checkpoint_args(checkpoint):
     return vars(args) if isinstance(args, Namespace) else args
 
 
+def resolve_task(override=None, checkpoint=None):
+    saved = checkpoint_args(checkpoint).get('task', 'segmentation')
+    task = saved if checkpoint is not None or override is None else override
+    if task not in ('segmentation', 'detection'):
+        raise ValueError(f'Unsupported task: {task}')
+    if checkpoint is not None and override is not None and override != task:
+        raise ValueError(f'task={override!r} conflicts with checkpoint task={task!r}; use --transfer for a new task.')
+    return task
+
+
 def resolve_train_augmentation(override=None, checkpoint=None):
     """Resume owns numeric settings; explicit CLI choices replace only enabled modes."""
     settings = (config.train_augmentation if checkpoint is None else
@@ -62,6 +72,8 @@ def checkpoint_state(checkpoint):
 
 
 def load_model_weights(model, checkpoint, strict=True):
+    if hasattr(model, 'task'):
+        resolve_task(model.task, checkpoint)
     if hasattr(model, 'seg_input'):
         resolve_seg_input(model.seg_input, checkpoint)
     state = checkpoint_state(checkpoint)
@@ -74,21 +86,28 @@ def transfer_model_weights(model, checkpoint):
     """Load weights only; allow flow -> flow_rgb with an initially silent RGB input."""
     source = resolve_seg_input(checkpoint=checkpoint)
     target = model.seg_input
-    if source == target:
+    source_task, target_task = resolve_task(checkpoint=checkpoint), getattr(model, 'task', 'segmentation')
+    if source_task != target_task and (source_task, target_task) != ('segmentation', 'detection'):
+        raise ValueError(f'Unsupported task transfer: {source_task} -> {target_task}.')
+    if source == target and source_task == target_task:
         return load_model_weights(model, checkpoint)
-    if (source, target) != ('flow', 'flow_rgb'):
+    if source != target and (source, target) != ('flow', 'flow_rgb'):
         raise ValueError(f'Unsupported seg_input transfer: {source} -> {target}.')
     state = checkpoint_state(checkpoint)
-    key = 'seg_head.initial_block.main_branch.weight'
-    old_weight = state.get(key)
-    expected = model.state_dict()[key]
-    if old_weight is None or tuple(old_weight.shape) != (6, 2, 3, 3) or tuple(expected.shape) != (6, 5, 3, 3):
-        raise ValueError('flow -> flow_rgb transfer requires a full ModelBuilder checkpoint with a 6x2x3x3 stem.')
-    expanded = old_weight.new_zeros(expected.shape)
-    expanded[:, :2].copy_(old_weight)
-    state[key] = expanded
+    if source != target:
+        key = 'seg_head.initial_block.main_branch.weight'
+        old_weight, expected = state.get(key), model.state_dict()[key]
+        if old_weight is None or tuple(old_weight.shape) != (6, 2, 3, 3) or tuple(expected.shape) != (6, 5, 3, 3):
+            raise ValueError('flow -> flow_rgb transfer requires a full ModelBuilder checkpoint with a 6x2x3x3 stem.')
+        expanded = old_weight.new_zeros(expected.shape)
+        expanded[:, :2].copy_(old_weight)
+        state[key] = expanded
+        print('Transferred flow -> flow_rgb: copied flow weights; initialized RGB weights to zero.')
+    if source_task != target_task:
+        # Fill only the new head; all shared weights must match strictly.
+        state.update({key: value for key, value in model.state_dict().items() if key.startswith('detection_head.')})
+        print('Transferred segmentation -> detection: shared weights loaded; detection head initialized.')
     result = model.load_state_dict(state, strict=True)
-    print('Transferred flow -> flow_rgb: copied flow weights; initialized RGB weights to zero.')
     return result
 
 

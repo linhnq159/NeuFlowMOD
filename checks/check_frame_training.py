@@ -310,7 +310,7 @@ class DatasetChecks(unittest.TestCase):
 
 
 class TinyModel(nn.Module):
-    def __init__(self, seg_input='flow'):
+    def __init__(self, seg_input='flow', task='segmentation'):
         super().__init__()
         self.seg_input = seg_input
         self.backbone_op = nn.Sequential(nn.Conv2d(3, 3, 1), nn.BatchNorm2d(3))

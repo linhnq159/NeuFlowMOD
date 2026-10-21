@@ -27,7 +27,7 @@ from tool.segmentation_boxes import contour_boxes, draw_bounding_boxes
 class RecordingModel(nn.Module):
     instances = []
 
-    def __init__(self, seg_input='flow'):
+    def __init__(self, seg_input='flow', task='segmentation'):
         super().__init__()
         self.seg_input = seg_input
         self.weight = nn.Parameter(torch.ones(()))

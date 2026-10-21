@@ -1,4 +1,4 @@
-"""Segment a video or one image sequence using current/past frame pairs."""
+"""Infer segmentation masks or learned boxes on a video or image sequence."""
 
 import csv
 from collections import Counter, deque
@@ -27,20 +27,22 @@ from NeuFlow.config import SEG_INPUT_MODES
 from NeuFlow.model_builder import ModelBuilder
 from tool.checkpoints import checkpoint_args, load_checkpoint, load_model_weights
 from tool.infer import resolve_config
+from tool.detection import add_detection_arguments, decode_detections, draw_detections
 from tool.training_log import write_json
 from tool.segmentation_boxes import (add_box_arguments, validate_box_arguments,
                                      contour_boxes, draw_bounding_boxes)
 
 
 TIMING_FIELDS = ('frame_index', 'source', 'past_index', 'past_source', 'predicted',
-                 'foreground_pixels', 'box_count', 'boxes_xywh', 'alignment', 'alignment_reason',
+                 'foreground_pixels', 'box_count', 'boxes_xywh', 'box_scores', 'alignment', 'alignment_reason',
                  'decode_ms', 'preprocess_ms', 'transfer_ms', 'forward_ms',
                  'postprocess_ms', 'write_ms', 'frame_ms')
 
 
 def parse_args(argv=None):
     parser = ArgumentParser(description=__doc__)
-    parser.add_argument('--checkpoint', required=True, help='Full ModelBuilder segmentation checkpoint')
+    add_detection_arguments(parser)
+    parser.add_argument('--checkpoint', required=True, help='Full ModelBuilder checkpoint; owns the task')
     parser.add_argument('--input', required=True, help='Video file or one folder of naturally sorted frames')
     parser.add_argument('--output', required=True, help='Overlay video (.mp4 or .avi); no audio')
     parser.add_argument('--mask_dir', help='Optional directory of original-size binary PNG masks')
@@ -177,6 +179,11 @@ def predict_pair(model, current, past, args, device):
     _sync(device)
     times['forward_ms'] = (time.perf_counter() - started) * 1000
     started = time.perf_counter()
+    if args.task == 'detection':
+        prediction = decode_detections(logits, (current_tensor.shape[-1], current_tensor.shape[-2]), current.size,
+                                        args.conf_threshold, args.nms_iou, args.max_detections)[0].cpu()
+        times['postprocess_ms'] = (time.perf_counter() - started) * 1000
+        return prediction, alignment, times
     if not torch.isfinite(logits).all():
         raise RuntimeError('Model produced non-finite mask logits.')
     logits = F.interpolate(logits.float(), size=(current.height, current.width),
@@ -207,20 +214,20 @@ def run_inference(args):
     checkpoint = load_checkpoint(checkpoint_path)
     resolve_video_config(args, checkpoint)
     device = torch.device(args.device)
-    model = ModelBuilder(seg_input=args.seg_input).to(device)
+    model = ModelBuilder(seg_input=args.seg_input, task=args.task).to(device)
     load_model_weights(model, checkpoint)
     model.eval()
     _sync(device)
     setup_seconds = time.perf_counter() - started
     precision = 'AMP FP16' if args.amp and device.type == 'cuda' else 'FP32'
-    print(f'Input: {input_path}; resize: {args.img_size or "native"}; frame_skip: {args.frame_skip}; '
+    print(f'Task: {args.task}; Input: {input_path}; resize: {args.img_size or "native"}; frame_skip: {args.frame_skip}; '
           f'seg_input: {args.seg_input}; stabilization: {args.stabilization}; precision: {precision}; '
-          f'threshold: {args.threshold}')
+          f'threshold: {args.conf_threshold if args.task == "detection" else args.threshold}')
     report = dict(status='running', checkpoint=str(checkpoint_path), checkpoint_epoch=checkpoint.get('epoch'),
                   input=str(input_path), output=str(output_path), timings=str(timings_path),
                   config=vars(args).copy(), precision=precision, setup_seconds=setup_seconds,
                   frames_written=0, predicted_frames=0, initial_frames=0,
-                  boxes_drawn=0 if args.draw_boxes else None)
+                  boxes_drawn=0 if args.draw_boxes or args.task == 'detection' else None)
     alignment_counts = Counter()
     totals = Counter()
     writer = None
@@ -266,13 +273,19 @@ def run_inference(args):
                         except Exception as error:
                             raise RuntimeError(f'Inference failed: current={name}, past={past_name}: {error}') from error
                         row.update(timings, predicted=True, past_index=past_index, past_source=past_name,
-                                   foreground_pixels=int(np.count_nonzero(mask)),
+                                   foreground_pixels=int(np.count_nonzero(mask)) if args.task == 'segmentation' else None,
                                    alignment=('disabled' if alignment.mode == 'none' else
                                               'aligned' if alignment.success else 'fallback'),
                                    alignment_reason=alignment.reason)
                     write_started = time.perf_counter()
-                    overlay = overlay_frame(current, mask, args.overlay_alpha)
-                    if mask is not None and args.draw_boxes:
+                    overlay = overlay_frame(current, mask if args.task == 'segmentation' else None, args.overlay_alpha)
+                    if mask is not None and args.task == 'detection':
+                        overlay = draw_detections(overlay, mask, thickness=args.box_thickness)
+                        boxes = mask[:, :4].clone()
+                        boxes[:, 2:] -= boxes[:, :2]
+                        row.update(box_count=len(mask), boxes_xywh=json.dumps(boxes.tolist(), separators=(',', ':')),
+                                   box_scores=json.dumps(mask[:, 4].tolist(), separators=(',', ':')))
+                    elif mask is not None and args.draw_boxes:
                         boxes = contour_boxes(mask, args.min_contour_area)
                         overlay = draw_bounding_boxes(overlay, boxes, args.box_thickness)
                         row.update(box_count=len(boxes), boxes_xywh=json.dumps(boxes, separators=(',', ':')))
@@ -324,7 +337,7 @@ def run_inference(args):
                           first_prediction_included=True, stage_totals_ms=dict(totals),
                           alignment_counts=dict(alignment_counts))
             write_json(stats_path, report)
-    print(f'{report["status"]}: {report["frames_written"]} frames, {report["predicted_frames"]} masks; '
+    print(f'{report["status"]}: {report["frames_written"]} frames, {report["predicted_frames"]} predictions; '
           f'pipeline {report["pipeline_fps"]:.2f} FPS; mean forward {report["mean_forward_ms"]:.2f} ms')
     print(f'Overlay: {output_path}\nStatistics: {stats_path}\nPer-frame timings: {timings_path}')
     if report.get('warning'):

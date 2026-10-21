@@ -1,4 +1,4 @@
-"""Export a full frame-pair MOD model with fixed shapes and verify ONNX logits."""
+"""Export a frame-pair mask or detection model with fixed shapes and verify ONNX outputs."""
 
 import copy
 import hashlib
@@ -17,8 +17,10 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from NeuFlow.model_builder import ModelBuilder
+from NeuFlow.detection_head import DETECTION_OUTPUTS
+from tool.detection import decode_detections, DETECTION_CONFIG
 from external.ILNet.model.LW_Opticalflow import SEBlock
-from tool.checkpoints import checkpoint_args, load_checkpoint, load_model_weights, resolve_seg_input
+from tool.checkpoints import checkpoint_args, load_checkpoint, load_model_weights, resolve_seg_input, resolve_task
 
 
 class HalfScale(nn.Module):
@@ -51,7 +53,8 @@ class ExportModel(nn.Module):
         self.model._flow_init_key = (1, height, width, torch.device('cpu'), False)
 
     def forward(self, current, past):
-        return self.model(current, past, self.iters_s16, self.iters_s8)
+        output = self.model(current, past, self.iters_s16, self.iters_s8)
+        return tuple(output[key] for key in DETECTION_OUTPUTS) if isinstance(output, dict) else output
 
 
 def validate_shape_iterations(img_size, iters_s16, iters_s8):
@@ -88,6 +91,35 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+def compare_outputs(reference, actual, img_size, atol=1e-3, rtol=1e-3):
+    """Compare all raw outputs and decoded boxes, preserving legacy mask checks."""
+    if set(reference) != set(actual):
+        raise ValueError('Output names differ from reference.')
+    if set(reference) == {'logits'}:
+        return compare_logits(reference['logits'], actual['logits'], atol, rtol)
+    checks = {}
+    for name in DETECTION_OUTPUTS:
+        checks[name] = compare_logits(reference[name], actual[name], atol, rtol)
+        checks[name].pop('mask_agreement')
+    decoded = [decode_detections({name: torch.from_numpy(values[name]) for name in DETECTION_OUTPUTS}, img_size)
+               for values in (reference, actual)]
+    # Match by coordinates rather than score order, which can change for near-ties.
+    boxes_match = True
+    for expected, observed in zip(*decoded):
+        if len(expected) != len(observed):
+            boxes_match = False
+            break
+        remaining = list(range(len(observed)))
+        for row in expected:
+            matches = [i for i in remaining if torch.allclose(row, observed[i], atol=max(.01, atol * 8), rtol=rtol)]
+            if not matches:
+                boxes_match = False
+                break
+            remaining.remove(matches[0])
+    return dict(passed=all(check['passed'] for check in checks.values()) and boxes_match,
+                outputs=checks, decoded_boxes_match=boxes_match)
+
+
 def export_model(model, output, img_size=(960, 544), iters_s16=1, iters_s8=8, seed=1211):
     try:
         import onnx
@@ -101,15 +133,19 @@ def export_model(model, output, img_size=(960, 544), iters_s16=1, iters_s8=8, se
     output.parent.mkdir(parents=True, exist_ok=True)
     width, height = img_size
     wrapper = ExportModel(model, width, height, iters_s16, iters_s8)
+    task = getattr(model, 'task', 'segmentation')
+    names = list(DETECTION_OUTPUTS) if task == 'detection' else ['logits']
     pairs = validation_pairs(width, height, seed)
     references = []
     with torch.inference_mode(), sdpa_kernel(SDPBackend.MATH):
         for current, past in pairs:
-            references.append(wrapper(current, past).numpy())
+            values = wrapper(current, past)
+            values = values if isinstance(values, tuple) else (values,)
+            references.append({name: value.numpy() for name, value in zip(names, values)})
         temporary = output.with_suffix('.partial.onnx')
         try:
             torch.onnx.export(wrapper, pairs[0], str(temporary), opset_version=16,
-                              input_names=['current', 'past'], output_names=['logits'],
+                              input_names=['current', 'past'], output_names=names,
                               dynamo=False, do_constant_folding=True)
             graph = onnx.load(str(temporary))
             onnx.checker.check_model(graph)
@@ -120,8 +156,8 @@ def export_model(model, output, img_size=(960, 544), iters_s16=1, iters_s8=8, se
             checks = []
             for pair, reference in zip(pairs, references):
                 current, past = pair
-                actual = session.run(['logits'], {'current': current.numpy(), 'past': past.numpy()})[0]
-                check = compare_logits(reference, actual)
+                actual = dict(zip(names, session.run(names, {'current': current.numpy(), 'past': past.numpy()})))
+                check = compare_outputs(reference, actual, img_size)
                 checks.append(check)
                 if not check['passed']:
                     raise RuntimeError(f'PyTorch/ONNX logit validation failed: {check}')
@@ -133,16 +169,18 @@ def export_model(model, output, img_size=(960, 544), iters_s16=1, iters_s8=8, se
     samples = {}
     for index, ((current, past), reference) in enumerate(zip(pairs, references)):
         samples.update({f'current_{index}': current.numpy(), f'past_{index}': past.numpy(),
-                        f'logits_{index}': reference})
+                        **{f'{name}_{index}': value for name, value in reference.items()}})
     np.savez(validation_path, **samples)
-    metadata = dict(seg_input=model.seg_input, img_size=list(img_size), batch_size=1,
+    metadata = dict(task=task, output_names=names, seg_input=model.seg_input, img_size=list(img_size), batch_size=1,
                     iters_s16=iters_s16, iters_s8=iters_s8, opset=16,
-                    input_dtype='float32', input_range=[0, 255], output='float32 logits',
+                    input_dtype='float32', input_range=[0, 255], output='float32 logits' if task == 'segmentation' else 'float32 center_logits, positive size, unit offset; decode/NMS external',
                     warp='external; not part of graph', folded_se_blocks=wrapper.folded_se_blocks,
                     pytorch_version=torch.__version__, onnx_version=onnx.__version__,
                     onnxruntime_version=ort.__version__, validation=checks,
                     validation_file=validation_path.name, validation_sha256=sha256_file(validation_path),
                     onnx_sha256=sha256_file(output))
+    if task == 'detection':
+        metadata['detection_config'] = dict(DETECTION_CONFIG)
     output.with_suffix('.json').write_text(json.dumps(metadata, indent=2) + '\n')
     print(f'Exported and verified {output} ({model.seg_input}, S8={iters_s8})')
     return metadata
@@ -153,6 +191,7 @@ def main(argv=None):
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--output', required=True)
     parser.add_argument('--seg_input', choices=['flow', 'flow_rgb'])
+    parser.add_argument('--task', choices=['segmentation', 'detection'])
     parser.add_argument('--img_size', nargs=2, type=int)
     parser.add_argument('--iters_s16', type=int)
     parser.add_argument('--iters_s8', type=int)
@@ -173,7 +212,7 @@ def main(argv=None):
     iters_s8 = args.iters_s8 if args.iters_s8 is not None else saved.get('iters_s8', 8)
     validate_shape_iterations(img_size, iters_s16, iters_s8)
     mode = resolve_seg_input(args.seg_input, checkpoint)
-    model = ModelBuilder(seg_input=mode).eval()
+    model = ModelBuilder(seg_input=mode, task=resolve_task(args.task, checkpoint)).eval()
     load_model_weights(model, checkpoint)
     export_model(model, args.output, img_size, iters_s16, iters_s8)
 

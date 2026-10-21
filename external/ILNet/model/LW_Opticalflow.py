@@ -412,6 +412,15 @@ class BoundaryAwareDecoder(nn.Module):
 
 # Lightweight Infrared small segmentation
 class LW_MOD(nn.Module):
+    def detection_feature_parameters(self):
+        """Only modules used on the path to x4; excludes mask decoders and unused modules."""
+        prefixes = ('initial_block', 'downsample1_', 'regular1_', 'downsample2_',
+                    'Depthwise2_', 'Atrous2_', 'Asymmetric2_', 'Depthwise3_', 'Atrous3_',
+                    'Asymmetric3_', 'transposed4_', 'regular4_')
+        for name, module in self.named_children():
+            if name.startswith(prefixes):
+                yield from module.parameters()
+
     def __init__(self, n_classes=1, encoder_relu=False, decoder_relu=True, channel=(8, 32, 64), dilations=(2,4,8,16), kernel_size=(3,5,7,9), padding=(1,2,3,4), in_channels=2):
         super().__init__()
 
@@ -570,7 +579,7 @@ class LW_MOD(nn.Module):
         # self.out_cnn = nn.Conv2d(3, 3, kernel_size=1)
         # self.bn = nn.BatchNorm2d(3)
 
-    def forward(self, x):
+    def forward(self, x, features_only=False):
         # print(x.size())
         B,C,H,W = x.size()
         decode_outputs = []
@@ -624,6 +633,9 @@ class LW_MOD(nn.Module):
         # x4 = self.ext_conv1(x4)
         x4 = self.regular4_1(x4)                                       # 1 32 64 64
         x4 = self.regular4_2(x4)                                       # 1 32 64 64
+
+        if features_only:
+            return x4
 
         decode_outputs.append(F.interpolate(self.out1(x4), size=[H, W], mode='bilinear', align_corners=False))
 

@@ -23,8 +23,9 @@ import numpy as np
 import torch
 
 from NeuFlow.model_builder import ModelBuilder
-from tool.checkpoints import load_checkpoint, load_model_weights, load_weights, resolve_seg_input, transfer_model_weights
-from tool.export_seg import compare_logits, export_model, sha256_file, validate_shape_iterations
+from tool.checkpoints import load_checkpoint, load_model_weights, load_weights, resolve_seg_input, transfer_model_weights, resolve_task
+from tool.export_seg import compare_logits, compare_outputs, export_model, sha256_file, validate_shape_iterations
+from NeuFlow.detection_head import DETECTION_OUTPUTS
 
 
 def cost_estimate(img_size):
@@ -40,16 +41,17 @@ def cost_estimate(img_size):
                 latency_ms=None, within_five_percent=None)
 
 
-def make_model_pair(checkpoint=None, backbone_pretrained=None, seed=1211):
+def make_model_pair(checkpoint=None, backbone_pretrained=None, seed=1211, task=None):
     torch.manual_seed(seed)
-    flow = ModelBuilder(seg_input='flow').eval()
+    task = resolve_task(task, checkpoint)
+    flow = ModelBuilder(seg_input='flow', task=task).eval()
     if checkpoint is not None:
         resolve_seg_input('flow', checkpoint)
         load_model_weights(flow, checkpoint)
     elif backbone_pretrained:
         load_weights(flow.backbone_op, backbone_pretrained)
-    rgb = ModelBuilder(seg_input='flow_rgb').eval()
-    transfer_model_weights(rgb, {'model': flow.state_dict(), 'args': {'seg_input': 'flow'}})
+    rgb = ModelBuilder(seg_input='flow_rgb', task=task).eval()
+    transfer_model_weights(rgb, {'model': flow.state_dict(), 'args': {'seg_input': 'flow', 'task': task}})
     generator = torch.Generator().manual_seed(seed + 1)
     with torch.no_grad():
         # Checkpoint conversion uses zeros; timing must exercise a nonzero RGB path.
@@ -60,7 +62,7 @@ def make_model_pair(checkpoint=None, backbone_pretrained=None, seed=1211):
 def prepare(args):
     folder = Path(args.output_dir)
     checkpoint = load_checkpoint(args.checkpoint) if args.checkpoint else None
-    models = make_model_pair(checkpoint, args.backbone_pretrained if checkpoint is None else None, args.seed)
+    models = make_model_pair(checkpoint, args.backbone_pretrained if checkpoint is None else None, args.seed, getattr(args, 'task', None))
     artifacts = []
     for iterations in args.iters_s8:
         for mode, model in models.items():
@@ -69,7 +71,7 @@ def prepare(args):
             artifacts.append(dict(mode=mode, iters_s8=iterations, onnx=output.name,
                                   metadata=output.with_suffix('.json').name,
                                   sha256=metadata['onnx_sha256']))
-    manifest = dict(version=1, img_size=args.img_size, batch_size=1, iters_s16=args.iters_s16,
+    manifest = dict(version=1, task=models['flow'].task, img_size=args.img_size, batch_size=1, iters_s16=args.iters_s16,
                     iters_s8=args.iters_s8, seed=args.seed, models=artifacts,
                     source_checkpoint=args.checkpoint, backbone_pretrained=args.backbone_pretrained,
                     rgb_weights='copied flow weights + seeded nonzero RGB weights; latency experiment only',
@@ -139,9 +141,10 @@ class TensorRTRunner:
             raise RuntimeError('Unable to allocate TensorRT execution context.')
         self.stream = torch.cuda.Stream()
         self.device, self.host = {}, {}
-        expected = {'current': trt.TensorIOMode.INPUT, 'past': trt.TensorIOMode.INPUT,
-                    'logits': trt.TensorIOMode.OUTPUT}
         names = {self.engine.get_tensor_name(i) for i in range(self.engine.num_io_tensors)}
+        self.output_names = ['logits'] if 'logits' in names else list(DETECTION_OUTPUTS)
+        expected = {'current': trt.TensorIOMode.INPUT, 'past': trt.TensorIOMode.INPUT,
+                    **{name: trt.TensorIOMode.OUTPUT for name in self.output_names}}
         if names != set(expected):
             raise ValueError(f'Unexpected engine I/O: {names}')
         for name, mode in expected.items():
@@ -170,11 +173,15 @@ class TensorRTRunner:
         self.stream.synchronize()
 
     def logits(self):
+        return self.outputs()['logits']
+
+    def outputs(self):
         with torch.cuda.stream(self.stream):
             self.enqueue()
-            self.host['logits'].copy_(self.device['logits'], non_blocking=True)
+            for name in self.output_names:
+                self.host[name].copy_(self.device[name], non_blocking=True)
         self.stream.synchronize()
-        return self.host['logits'].numpy().copy()
+        return {name: self.host[name].numpy().copy() for name in self.output_names}
 
     def sample(self, transfers):
         start = time.perf_counter()
@@ -186,7 +193,8 @@ class TensorRTRunner:
             self.enqueue()
             self.end_event.record(self.stream)
             if transfers:
-                self.host['logits'].copy_(self.device['logits'], non_blocking=True)
+                for name in self.output_names:
+                    self.host[name].copy_(self.device[name], non_blocking=True)
         self.stream.synchronize()
         host_ms = (time.perf_counter() - start) * 1000
         return float(self.start_event.elapsed_time(self.end_event)), host_ms
@@ -243,6 +251,7 @@ def run_benchmark(args):
         if not metadata['validation'] or not all(check['passed'] for check in metadata['validation']):
             raise ValueError(f'ONNX validation missing or failed: {path}')
         if (metadata['img_size'] != manifest['img_size'] or metadata['batch_size'] != 1
+                or metadata.get('task', 'segmentation') != manifest.get('task', 'segmentation')
                 or metadata['iters_s16'] != manifest['iters_s16']
                 or metadata['iters_s8'] != artifact['iters_s8'] or metadata['seg_input'] != artifact['mode']):
             raise ValueError(f'Inconsistent benchmark configuration: {path}')
@@ -275,9 +284,10 @@ def run_benchmark(args):
                     with np.load(folder / metadata['validation_file']) as validation:
                         for index in range(2):
                             runner.load_inputs(validation[f'current_{index}'], validation[f'past_{index}'])
-                            check = compare_logits(validation[f'logits_{index}'], runner.logits(),
-                                                   atol=args.atol, rtol=args.rtol)
-                            check['passed'] = check['passed'] and check['mask_agreement'] >= args.min_mask_agreement
+                            reference = {name: validation[f'{name}_{index}'] for name in runner.output_names}
+                            check = compare_outputs(reference, runner.outputs(), manifest['img_size'], atol=args.atol, rtol=args.rtol)
+                            if 'mask_agreement' in check:
+                                check['passed'] = check['passed'] and check['mask_agreement'] >= args.min_mask_agreement
                             checks.append(check)
                             if not check['passed']:
                                 raise RuntimeError(f'TensorRT logit validation failed for {mode}: {check}')
@@ -346,6 +356,7 @@ def parse_args(argv=None):
     parser.add_argument('--phase', choices=['estimate', 'prepare', 'run', 'all'], default='all')
     parser.add_argument('--output_dir', required=True)
     parser.add_argument('--checkpoint', help='Optional trained flow-only ModelBuilder checkpoint')
+    parser.add_argument('--task', choices=['segmentation', 'detection'])
     parser.add_argument('--backbone_pretrained', default=str(ROOT / 'neuflow_sintel.pth'))
     parser.add_argument('--img_size', nargs=2, type=int, default=[960, 544])
     parser.add_argument('--iters_s16', type=int, default=1)
