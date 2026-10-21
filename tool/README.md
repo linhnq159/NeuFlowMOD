@@ -609,6 +609,34 @@ to S16=1 and S8=8. Stabilization follows the checkpoint rules above. `--device`
 defaults to CUDA when available, otherwise CPU; `--no-amp` disables CUDA AMP.
 The script prints alignment success/fallback and the chosen model input size.
 
+Add `--draw_boxes` to find contours in the final binary mask and draw their
+bounding boxes in red on the original current frame:
+
+```bash
+python tool/infer.py \
+  --checkpoint /path/to/run/checkpoint/best_iou.pth \
+  --current /data/frame_010.png \
+  --past /data/frame_007.png \
+  --output results/frame_010_mask.png \
+  --draw_boxes \
+  --device cuda:0 \
+  --no-amp
+```
+
+This writes both the binary `frame_010_mask.png` and an RGB image named
+`frame_010_mask_boxes.png`. Box detection uses **external contours** after
+upsampling logits to original frame size and applying the probability
+threshold. Each contour gets a separate axis-aligned box; holes do not create
+extra boxes. No merging, tracking or mask cleanup is applied.
+
+Both inference CLIs accept `--min_contour_area AREA` (default **0**) and
+`--box_thickness PIXELS` (default **2**). Area is OpenCV's geometric contour
+area in original-image pixel units, not the foreground-pixel count or box area.
+Single pixels and thin lines can have zero contour area and are kept by the
+default. A positive minimum filters them out; for example,
+`--min_contour_area 20` keeps only contours with area at least 20. Filtering
+affects the drawn boxes only; saved mask PNGs retain the original predictions.
+
 ## Video and image-sequence segmentation inference
 
 `tool/infer_video.py` processes a video or **one sequence folder** with the same
@@ -667,6 +695,28 @@ The overlay blends foreground pixels with green; adjust its opacity with
 0/255 named `frame_000003.png`, etc. Names use **zero-based source indices**;
 the timing CSV maps each index to its original filename and past frame.
 The first frames without a prediction have no mask file.
+
+Use the same `--draw_boxes` option to draw contour boxes on the overlay video:
+
+```bash
+python tool/infer_video.py \
+  --checkpoint /path/to/run/checkpoint/best_iou.pth \
+  --input /data/example.mp4 \
+  --output results/example_boxes.mp4 \
+  --draw_boxes \
+  --device cuda:0 \
+  --no-amp
+```
+
+Boxes use original-frame coordinates before any encoder padding. Add
+`--overlay_alpha 0` to show boxes on the original frames without green mask
+fill. Initial frames without a prediction have no boxes. When enabled, the
+CSV includes `box_count` and `boxes_xywh` (a JSON array of `[x, y, width, height]`
+for each predicted frame); a prediction with no retained contours has count 0
+and `[]`. These fields are blank when box drawing is disabled or no prediction
+is available. The summary records `boxes_drawn`, summed over all processed
+frames, or null if disabled. Contour finding and drawing are included in
+`write_ms` and pipeline FPS.
 
 Output `.mp4` uses `mp4v`, and `.avi` uses `MJPG`; `--codec FOURCC` can override
 this if supported by your OpenCV build. Video FPS is inherited from the source;

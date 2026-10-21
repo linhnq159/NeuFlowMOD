@@ -18,6 +18,8 @@ from NeuFlow.model_builder import ModelBuilder
 from tool.checkpoints import (checkpoint_args, load_checkpoint, load_model_weights,
                               resolve_stabilization, resolve_seg_input)
 from NeuFlow.config import SEG_INPUT_MODES
+from tool.segmentation_boxes import (add_box_arguments, validate_box_arguments,
+                                     contour_boxes, draw_bounding_boxes)
 
 
 def parse_args(argv=None):
@@ -38,7 +40,9 @@ def parse_args(argv=None):
     parser.add_argument('--device', default='cuda:0' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--amp', action=BooleanOptionalAction, default=True)
     parser.add_argument('--threshold', type=float, default=0.5)
+    add_box_arguments(parser)
     args = parser.parse_args(argv)
+    validate_box_arguments(args, parser)
     if not 0 <= args.threshold <= 1:
         parser.error('--threshold must be between 0 and 1.')
     if Path(args.output).suffix.lower() != '.png':
@@ -66,8 +70,12 @@ def resolve_config(args, checkpoint):
 def run_inference(args):
     paths = [Path(value).expanduser().resolve() for value in (args.checkpoint, args.current, args.past)]
     output_path = Path(args.output).expanduser().resolve()
+    boxes_path = (output_path.with_name(f'{output_path.stem}_boxes.png').resolve()
+                  if getattr(args, 'draw_boxes', False) else None)
     if output_path in paths:
         raise ValueError('Output mask must not overwrite either input image or the checkpoint.')
+    if boxes_path in paths or boxes_path == output_path:
+        raise ValueError('Bounding-box image must not overwrite either input image or the checkpoint.')
     checkpoint_path, current_path, past_path = paths
     checkpoint = load_checkpoint(checkpoint_path)
     resolve_config(args, checkpoint)
@@ -92,6 +100,12 @@ def run_inference(args):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(mask).save(output_path, format='PNG')
     print(f'Mask saved: {output_path} ({original_size[0]}x{original_size[1]})')
+    if boxes_path is not None:
+        boxes = contour_boxes(mask, args.min_contour_area)
+        with Image.open(current_path) as frame:
+            annotated = draw_bounding_boxes(frame.convert('RGB'), boxes, args.box_thickness)
+        Image.fromarray(annotated).save(boxes_path, format='PNG')
+        print(f'Bounding boxes: {len(boxes)}; image saved: {boxes_path}')
     return mask, alignment
 
 

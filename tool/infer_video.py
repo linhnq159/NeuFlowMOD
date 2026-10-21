@@ -28,10 +28,12 @@ from NeuFlow.model_builder import ModelBuilder
 from tool.checkpoints import checkpoint_args, load_checkpoint, load_model_weights
 from tool.infer import resolve_config
 from tool.training_log import write_json
+from tool.segmentation_boxes import (add_box_arguments, validate_box_arguments,
+                                     contour_boxes, draw_bounding_boxes)
 
 
 TIMING_FIELDS = ('frame_index', 'source', 'past_index', 'past_source', 'predicted',
-                 'foreground_pixels', 'alignment', 'alignment_reason',
+                 'foreground_pixels', 'box_count', 'boxes_xywh', 'alignment', 'alignment_reason',
                  'decode_ms', 'preprocess_ms', 'transfer_ms', 'forward_ms',
                  'postprocess_ms', 'write_ms', 'frame_ms')
 
@@ -58,7 +60,9 @@ def parse_args(argv=None):
     parser.add_argument('--fps', type=float, help='Output playback FPS; default: video FPS or 30 for images')
     parser.add_argument('--max_frames', type=int, help='Process at most N source frames, including initial frames')
     parser.add_argument('--codec', help='Optional four-character codec; default: mp4v for MP4, MJPG for AVI')
+    add_box_arguments(parser)
     args = parser.parse_args(argv)
+    validate_box_arguments(args, parser)
     for name in ('threshold', 'overlay_alpha'):
         if not 0 <= getattr(args, name) <= 1:
             parser.error(f'--{name} must be between 0 and 1.')
@@ -215,7 +219,8 @@ def run_inference(args):
     report = dict(status='running', checkpoint=str(checkpoint_path), checkpoint_epoch=checkpoint.get('epoch'),
                   input=str(input_path), output=str(output_path), timings=str(timings_path),
                   config=vars(args).copy(), precision=precision, setup_seconds=setup_seconds,
-                  frames_written=0, predicted_frames=0, initial_frames=0)
+                  frames_written=0, predicted_frames=0, initial_frames=0,
+                  boxes_drawn=0 if args.draw_boxes else None)
     alignment_counts = Counter()
     totals = Counter()
     writer = None
@@ -267,6 +272,10 @@ def run_inference(args):
                                    alignment_reason=alignment.reason)
                     write_started = time.perf_counter()
                     overlay = overlay_frame(current, mask, args.overlay_alpha)
+                    if mask is not None and args.draw_boxes:
+                        boxes = contour_boxes(mask, args.min_contour_area)
+                        overlay = draw_bounding_boxes(overlay, boxes, args.box_thickness)
+                        row.update(box_count=len(boxes), boxes_xywh=json.dumps(boxes, separators=(',', ':')))
                     bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
                     if encoded_size != original_size:
                         bgr = cv2.copyMakeBorder(bgr, 0, encoded_size[1] - original_size[1],
@@ -280,6 +289,8 @@ def run_inference(args):
                     stream.flush()
                     report['frames_written'] += 1
                     report['predicted_frames' if mask is not None else 'initial_frames'] += 1
+                    if row['box_count'] is not None:
+                        report['boxes_drawn'] += row['box_count']
                     if mask is not None:
                         alignment_counts[f'{row["alignment"]}:{row["alignment_reason"]}'] += 1
                     for field in TIMING_FIELDS:
